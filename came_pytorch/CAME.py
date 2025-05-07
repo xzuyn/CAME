@@ -6,7 +6,8 @@ from torch.optim import Optimizer
 
 
 class CAME(Optimizer):
-    """Implements CAME algorithm with additions.
+    """
+    Implements CAME algorithm with additions.
 
     This implementation is based on:
       - CAME: Confidence-guided Adaptive Memory Efficient Optimization (https://arxiv.org/abs/2307.02047)
@@ -163,6 +164,7 @@ class CAME(Optimizer):
         # Copy sum into tensor_input using stochastic rounding
         self._copy_stochastic(tensor_input, summed)
 
+    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
     def _quantize_state(self, state_tensor, block_size):
         """Quantizes the state tensor to 8-bit with simple min-max per block"""
         if state_tensor.numel() <= 1:
@@ -176,6 +178,7 @@ class CAME(Optimizer):
             quantized_chunks.append({"data": quantized_data, "scale": scale, "min": chunk_min})
         return quantized_chunks
 
+    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
     def _dequantize_state(self, quantized_chunks):
         """Dequantizes quantized chunks back to float32"""
         if not isinstance(quantized_chunks, list):
@@ -185,6 +188,7 @@ class CAME(Optimizer):
             chunks.append(c["data"].float() * c["scale"] + c["min"])
         return torch.cat(chunks)
 
+    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
     def print_layer_info(self, param_shape, use_8bit):
         size = np.prod(param_shape)
         layer_type = "unknown"
