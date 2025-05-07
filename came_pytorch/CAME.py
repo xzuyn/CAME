@@ -6,19 +6,24 @@ from torch.optim import Optimizer
 
 
 class CAME(Optimizer):
-    """Implements CAME algorithm.
+    """Implements CAME algorithm with additions.
+
     This implementation is based on:
-    `CAME: Confidence-guided Adaptive Memory Efficient Optimization`
+      - CAME: Confidence-guided Adaptive Memory Efficient Optimization (https://arxiv.org/abs/2307.02047)
+      - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192)
+      - Cautious Optimizers: Improving Training with One Line of Code (https://arxiv.org/abs/2411.16085)
+      - Grams: Gradient Descent with Adaptive Momentum Scaling (https://arxiv.org/abs/2412.17107)
+      - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer
+        (https://arxiv.org/abs/2501.18427)
+
     Args:
-        params (iterable): iterable of parameters to optimize or dicts defining
-            parameter groups
+        params (iterable): iterable of parameters to optimize or dicts defining parameter groups
         lr (float, optional): external learning rate (default: None)
         eps (tuple[float, float]): regularization constants for square gradient
             and instability respectively (default: (1e-30, 1e-16))
-        clip_threshold (float): threshold of root-mean-square of
-            final gradient update (default: 1.0)
+        clip_threshold (float): threshold of root-mean-square of final gradient update (default: 1.0)
         betas (tuple[float, float, float]): coefficient used for computing running averages of
-        update, square gradient and instability (default: (0.9, 0.999, 0.9999)))
+            update, square gradient and instability (default: (0.9, 0.999, 0.9999)))
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         enable_stochastic_rounding (bool, optional): utilize stochastic rounding with bfloat16 (default: False)
         enable_cautious (bool, optional): mask out update components whose sign
@@ -305,13 +310,11 @@ class CAME(Optimizer):
                 else:
                     update = exp_avg.clone()
 
-                # Cautious masking - https://arxiv.org/abs/2411.16085
                 if group["enable_cautious"]:
                     mask = (update * grad > 0).to(grad.dtype)
                     mask.div_(mask.mean().clamp_(min=1e-3))
                     update = update * mask
 
-                # Grams: adaptive momentum scaling - https://arxiv.org/abs/2412.17107
                 if group["enable_grams"]:
                     update = update.abs_().mul_(grad.sign_())
 
