@@ -72,14 +72,25 @@ class CAME(Optimizer):
         )
         super(CAME, self).__init__(params, defaults)
 
-        if enable_stochastic_rounding:
-            print("Using Stochastic Rounding for CAME.")
-        if enable_cautious:
-            print("Using Cautious Masking for CAME.")
-        if enable_grams:
-            print("Using Grams for CAME.")
-        if enable_8bit:
-            print(f"Initializing CAME with 8-bit support: block_size={block_size}, min_8bit_size={min_8bit_size}")
+        print("\n==== CAME Modifications ====")
+        if (
+            enable_stochastic_rounding
+            or enable_cautious
+            or enable_grams
+            or enable_8bit
+        ):
+
+            if enable_stochastic_rounding:
+                print("- Stochastic Rounding enabled.")
+            if enable_cautious:
+                print("- Cautious Masking enabled.")
+            if enable_grams:
+                print("- Grams enabled.")
+            if enable_8bit:
+                print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}.")
+        else:
+            print("- Using original CAME implementation.")
+        print("==== CAME Modifications ====\n")
 
     @property
     def supports_memory_efficient_fp16(self):
