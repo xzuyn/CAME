@@ -1,4 +1,5 @@
 import math
+import gc
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ class CAME(Optimizer):
         block_size (int, optional): quantization block size for 8-bit (default: 2048)
         min_8bit_size (int, optional): minimum number of parameters to use 8-bit (default: 16384)
         quiet_8bit (bool, optional): don't print layer info (default: True)
+        enable_gc (bool, optional): enable garbage collection before each step (default: False)
     """
 
     def __init__(
@@ -52,6 +54,7 @@ class CAME(Optimizer):
         block_size=2048,
         min_8bit_size=16384,
         quiet_8bit=True,
+        enable_gc=False,
     ):
         assert lr > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
@@ -69,6 +72,7 @@ class CAME(Optimizer):
             block_size=block_size,
             min_8bit_size=min_8bit_size,
             quiet_8bit=quiet_8bit,
+            enable_gc=enable_gc,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -78,6 +82,7 @@ class CAME(Optimizer):
             or enable_cautious
             or enable_grams
             or enable_8bit
+            or enable_gc
         ):
 
             if enable_stochastic_rounding:
@@ -88,6 +93,8 @@ class CAME(Optimizer):
                 print("- Grams enabled.")
             if enable_8bit:
                 print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}.")
+            if enable_gc:
+                print("- Garbage Collection enabled.")
         else:
             print("- Using original CAME implementation.")
         print("==== CAME Modifications ====\n")
@@ -215,6 +222,22 @@ class CAME(Optimizer):
         status = "8bit" if use_8bit else "32bit"
         print(f"{layer_type} layer with shape {param_shape}: {size:,} params -> using {status}")
 
+    # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
+    @staticmethod
+    def torch_gc():
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if torch.backends.mps.is_available():
+            torch.mps.synchronize()
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
     @torch.inference_mode()
     def step(self, closure=None):
         """Performs a single optimization step.
@@ -227,9 +250,13 @@ class CAME(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
+            if group["enable_gc"]:
+                self.torch_gc()
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
+
                 grad = p.grad.data
                 if grad.dtype in {torch.float16, torch.bfloat16}:
                     grad = grad.float()
