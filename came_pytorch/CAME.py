@@ -56,6 +56,8 @@ class CAME(Optimizer):
         quiet_8bit=True,
         enable_gc=False,
     ):
+        self.torch_gc()
+
         assert lr > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
 
@@ -84,7 +86,6 @@ class CAME(Optimizer):
             or enable_8bit
             or enable_gc
         ):
-
             if enable_stochastic_rounding:
                 print("- Stochastic Rounding enabled.")
             if enable_cautious:
