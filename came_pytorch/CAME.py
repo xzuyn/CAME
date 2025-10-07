@@ -240,6 +240,126 @@ class CAME(Optimizer):
             torch.mps.empty_cache()
 
     @torch.inference_mode()
+    def step_param(self, p, group):
+        if p.grad is None:
+            return
+
+        grad = p.grad.data
+        if grad.dtype in {torch.float16, torch.bfloat16}:
+            grad = grad.float()
+        if grad.is_sparse:
+            raise RuntimeError("CAME does not support sparse gradients.")
+
+        state = self.state[p]
+        grad_shape = grad.shape
+
+        factored = self._get_options(grad_shape)
+        use_8bit = group["enable_8bit"] and self._should_use_8bit(grad_shape)
+
+        # State Initialization
+        if len(state) == 0:
+            state["step"] = 0
+            # initialize first moment with optional 8-bit quantization
+            if not group["quiet_8bit"]:
+                self.print_layer_info(grad_shape, use_8bit)
+            if use_8bit:
+                state["exp_avg"] = self._quantize_state(torch.zeros_like(grad), group["block_size"])
+            else:
+                state["exp_avg"] = torch.zeros_like(grad)
+
+            if factored:
+                state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
+                state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
+                state["exp_avg_res_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
+                state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
+            else:
+                if use_8bit:
+                    state["exp_avg_sq"] = self._quantize_state(torch.zeros_like(grad), group["block_size"])
+                else:
+                    state["exp_avg_sq"] = torch.zeros_like(grad)
+            state["RMS"] = 0
+
+        state["step"] += 1
+        state["RMS"] = self._rms(p.data)
+
+        # load / dequantize first moment
+        if use_8bit:
+            exp_avg = self._dequantize_state(state["exp_avg"])
+        else:
+            exp_avg = state["exp_avg"]
+
+        update = (grad**2) + group["eps"][0]
+        if factored:
+            exp_avg_sq_row = state["exp_avg_sq_row"]
+            exp_avg_sq_col = state["exp_avg_sq_col"]
+
+            exp_avg_sq_row.mul_(group["betas"][1]).add_(update.mean(dim=-1), alpha=1.0 - group["betas"][1])
+            exp_avg_sq_col.mul_(group["betas"][1]).add_(update.mean(dim=-2), alpha=1.0 - group["betas"][1])
+
+            # Approximation of exponential moving average of square of gradient
+            update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+            update.mul_(grad)
+        else:
+            # non-factored: update second moment, quantize if needed
+            if use_8bit:
+                exp_avg_sq = self._dequantize_state(state["exp_avg_sq"])
+            else:
+                exp_avg_sq = state["exp_avg_sq"]
+            exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
+            if use_8bit:
+                state["exp_avg_sq"] = self._quantize_state(exp_avg_sq, group["block_size"])
+            else:
+                state["exp_avg_sq"] = exp_avg_sq
+            update = exp_avg_sq.rsqrt().mul_(grad)
+
+        update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+
+        # update first moment
+        exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
+        # re-quantize first moment if using 8bit
+        if use_8bit:
+            state["exp_avg"] = self._quantize_state(exp_avg, group["block_size"])
+        else:
+            state["exp_avg"] = exp_avg
+
+        # Confidence-guided strategy
+        # Calculation of instability
+        res = (update - exp_avg)**2 + group["eps"][1]
+
+        if factored:
+            exp_avg_res_row = state["exp_avg_res_row"]
+            exp_avg_res_col = state["exp_avg_res_col"]
+
+            exp_avg_res_row.mul_(group["betas"][2]).add_(res.mean(dim=-1), alpha=1.0 - group["betas"][2])
+            exp_avg_res_col.mul_(group["betas"][2]).add_(res.mean(dim=-2), alpha=1.0 - group["betas"][2])
+
+            # Approximation of exponential moving average of instability
+            res_approx = self._approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
+            update = res_approx.mul_(exp_avg)
+        else:
+            update = exp_avg.clone()
+
+        if group["enable_cautious"]:
+            mask = (update * grad > 0).to(grad.dtype)
+            mask.div_(mask.mean().clamp_(min=1e-3))
+            update = update * mask
+
+        if group["enable_grams"]:
+            update = update.abs_().mul_(grad.sign_())
+
+        if group["weight_decay"] != 0:
+            if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
+                self._add_stochastic(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+            else:
+                p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
+
+        update.mul_(group["lr"])
+        if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
+            self._add_stochastic(p.data, -update)
+        else:
+            p.data.add_(-update)
+
+    @torch.inference_mode()
     def step(self, closure=None):
         """Performs a single optimization step.
         Args:
@@ -255,122 +375,6 @@ class CAME(Optimizer):
                 self.torch_gc()
 
             for p in group["params"]:
-                if p.grad is None:
-                    continue
-
-                grad = p.grad.data
-                if grad.dtype in {torch.float16, torch.bfloat16}:
-                    grad = grad.float()
-                if grad.is_sparse:
-                    raise RuntimeError("CAME does not support sparse gradients.")
-
-                state = self.state[p]
-                grad_shape = grad.shape
-
-                factored = self._get_options(grad_shape)
-                use_8bit = group["enable_8bit"] and self._should_use_8bit(grad_shape)
-
-                # State Initialization
-                if len(state) == 0:
-                    state["step"] = 0
-                    # initialize first moment with optional 8-bit quantization
-                    if not group["quiet_8bit"]:
-                        self.print_layer_info(grad_shape, use_8bit)
-                    if use_8bit:
-                        state["exp_avg"] = self._quantize_state(torch.zeros_like(grad), group["block_size"])
-                    else:
-                        state["exp_avg"] = torch.zeros_like(grad)
-
-                    if factored:
-                        state["exp_avg_sq_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
-                        state["exp_avg_sq_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
-                        state["exp_avg_res_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
-                        state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
-                    else:
-                        if use_8bit:
-                            state["exp_avg_sq"] = self._quantize_state(torch.zeros_like(grad), group["block_size"])
-                        else:
-                            state["exp_avg_sq"] = torch.zeros_like(grad)
-                    state["RMS"] = 0
-
-                state["step"] += 1
-                state["RMS"] = self._rms(p.data)
-
-                # load / dequantize first moment
-                if use_8bit:
-                    exp_avg = self._dequantize_state(state["exp_avg"])
-                else:
-                    exp_avg = state["exp_avg"]
-
-                update = (grad**2) + group["eps"][0]
-                if factored:
-                    exp_avg_sq_row = state["exp_avg_sq_row"]
-                    exp_avg_sq_col = state["exp_avg_sq_col"]
-
-                    exp_avg_sq_row.mul_(group["betas"][1]).add_(update.mean(dim=-1), alpha=1.0 - group["betas"][1])
-                    exp_avg_sq_col.mul_(group["betas"][1]).add_(update.mean(dim=-2), alpha=1.0 - group["betas"][1])
-
-                    # Approximation of exponential moving average of square of gradient
-                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
-                    update.mul_(grad)
-                else:
-                    # non-factored: update second moment, quantize if needed
-                    if use_8bit:
-                        exp_avg_sq = self._dequantize_state(state["exp_avg_sq"])
-                    else:
-                        exp_avg_sq = state["exp_avg_sq"]
-                    exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
-                    if use_8bit:
-                        state["exp_avg_sq"] = self._quantize_state(exp_avg_sq, group["block_size"])
-                    else:
-                        state["exp_avg_sq"] = exp_avg_sq
-                    update = exp_avg_sq.rsqrt().mul_(grad)
-
-                update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
-
-                # update first moment
-                exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
-                # re-quantize first moment if using 8bit
-                if use_8bit:
-                    state["exp_avg"] = self._quantize_state(exp_avg, group["block_size"])
-                else:
-                    state["exp_avg"] = exp_avg
-
-                # Confidence-guided strategy
-                # Calculation of instability
-                res = (update - exp_avg)**2 + group["eps"][1]
-
-                if factored:
-                    exp_avg_res_row = state["exp_avg_res_row"]
-                    exp_avg_res_col = state["exp_avg_res_col"]
-
-                    exp_avg_res_row.mul_(group["betas"][2]).add_(res.mean(dim=-1), alpha=1.0 - group["betas"][2])
-                    exp_avg_res_col.mul_(group["betas"][2]).add_(res.mean(dim=-2), alpha=1.0 - group["betas"][2])
-
-                    # Approximation of exponential moving average of instability
-                    res_approx = self._approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
-                    update = res_approx.mul_(exp_avg)
-                else:
-                    update = exp_avg.clone()
-
-                if group["enable_cautious"]:
-                    mask = (update * grad > 0).to(grad.dtype)
-                    mask.div_(mask.mean().clamp_(min=1e-3))
-                    update = update * mask
-
-                if group["enable_grams"]:
-                    update = update.abs_().mul_(grad.sign_())
-
-                if group["weight_decay"] != 0:
-                    if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                        self._add_stochastic(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
-                    else:
-                        p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
-
-                update.mul_(group["lr"])
-                if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                    self._add_stochastic(p.data, -update)
-                else:
-                    p.data.add_(-update)
+                self.step_param(p, group)
 
         return loss
