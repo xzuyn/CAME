@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch.optim import Optimizer
 
+HAS_TRITON = False
 try:
     import triton
     import triton.language as tl
@@ -92,9 +93,6 @@ try:
         dequantized_data = (quantized_data.to(tl.float32) / 255.0) * scale + min_val
 
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
-
-except ImportError:
-    HAS_TRITON = False
 
 
 class CAME(Optimizer):
