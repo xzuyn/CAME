@@ -138,7 +138,7 @@ class CAME(Optimizer):
         enable_stochastic_rounding=False,
         enable_cautious=False,
         enable_8bit=False,
-        triton_8bit=False,
+        triton_8bit=True,
         block_size=2048,
         min_8bit_size=16384,
         quiet_8bit=True,
