@@ -59,7 +59,7 @@ try:
         input_vals = tl.load(input_ptr + offsets, mask=mask)
         
         quantized_vals = ((input_vals - min_val) / (scale + 1e-38)) * 255.0
-        quantized_vals = tl.extra.cuda.libdevice.rint(quantized_vals)
+        quantized_vals = tl.extra.libdevice.rint(quantized_vals)
         
         quantized_vals = tl.where(quantized_vals > 255.0, 255.0, quantized_vals)
         quantized_vals = tl.where(quantized_vals < 0.0, 0.0, quantized_vals)
