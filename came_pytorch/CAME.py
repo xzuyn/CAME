@@ -59,9 +59,28 @@ try:
         input_vals = tl.load(input_ptr + offsets, mask=mask)
 
         quantized_vals = ((input_vals - min_val) / scale) * 255.0
-        # TODO: Replace with triton round or stochastic round
-        quantized_vals = quantized_vals + 0.5
-        
+
+        # Compute floor and fractional part
+        q_floor = tl.floor(quantized_vals)
+        frac = quantized_vals - q_floor
+
+        # Simple per-element LCG RNG (uint32)
+        # seed derived from offsets and program id so different threads get different streams
+        seed = (offsets + pid * 196314165).to(tl.uint32)
+
+        # LCG constants (use Python ints, cast result to uint32)
+        a = 1664525
+        c = 1013904223
+        state = (seed * a + c).to(tl.uint32)
+
+        # convert to float in [0,1)
+        rnd = state.to(tl.float32) / 4294967296.0
+
+        # increment with probability = fractional part
+        inc = tl.where(rnd < frac, 1.0, 0.0)
+
+        quantized_vals = q_floor + inc
+
         quantized_vals = tl.where(quantized_vals > 255.0, 255.0, quantized_vals)
         quantized_vals = tl.where(quantized_vals < 0.0, 0.0, quantized_vals)
         quantized_vals = quantized_vals.to(tl.uint8)
@@ -298,7 +317,7 @@ class CAME(Optimizer):
     def _quantize_state_triton(self, state_tensor, block_size):
         n_elements = state_tensor.numel()
         num_quant_blocks = (n_elements + block_size - 1) // block_size
-        
+
         mins = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
         maxs = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
 
@@ -333,7 +352,7 @@ class CAME(Optimizer):
 
         n_elements = state_data.numel()
         output = torch.empty(original_shape, dtype=torch.float32, device=state_data.device)
-        
+
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         _dequantize_kernel[grid](
             output.flatten(),
@@ -448,7 +467,7 @@ class CAME(Optimizer):
         else:
             exp_avg = state["exp_avg"]
 
-        update = (grad**2) + group["eps"][0]
+        update = (grad ** 2) + group["eps"][0]
         if factored:
             exp_avg_sq_row = state["exp_avg_sq_row"]
             exp_avg_sq_col = state["exp_avg_sq_col"]
