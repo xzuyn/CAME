@@ -58,7 +58,7 @@ try:
         input_vals = tl.load(input_ptr + offsets, mask=mask)
         
         quantized_vals = ((input_vals - min_val) / scale) * 255.0
-        quantized_vals = quantized_vals + 0.5
+        quantized_vals = quantized_vals + 0.5  # TODO: Replace with triton round or stochastic round
         
         quantized_vals = tl.where(quantized_vals > 255.0, 255.0, quantized_vals)
         quantized_vals = tl.where(quantized_vals < 0.0, 0.0, quantized_vals)
