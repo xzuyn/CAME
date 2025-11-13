@@ -114,6 +114,91 @@ try:
 
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
 
+    @triton.jit
+    def _copy_stochastic_kernel(
+        target_ptr,           # pointer to bfloat16 output
+        source_ptr,           # pointer to float32 input
+        seed,                 # scalar seed
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Kernel that implements stochastic rounding of float32 'source' into bfloat16 'target'.
+        The strategy mirrors the CPU implementation: bitcast float32 -> uint32, add a uniform
+        16-bit random integer to the low 16 bits, mask-off the low 16 bits, bitcast back to float32,
+        then store as bfloat16.
+        """
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offs = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_elements
+
+        # load source (float32)
+        src = tl.load(source_ptr + offs, mask=mask)
+
+        # bitcast float32 -> uint32
+        src_bits = tl.cast(src, tl.uint32, bitcast=True)
+
+        # generate random int32 per element and reduce to 16 bits
+        rnd = tl.randint(seed, offs)
+        rnd16 = rnd & 0xFFFF
+
+        # add rnd to low bits and clear low 16 bits to simulate stochastic rounding
+        added = src_bits + rnd16
+        rounded_bits = added & 0xFFFF0000
+
+        # bitcast back to float32
+        rounded = tl.cast(rounded_bits, tl.float32, bitcast=True)
+
+        # store as bfloat16 (numeric cast)
+        out = tl.cast(rounded, tl.bfloat16)
+        tl.store(target_ptr + offs, out, mask=mask)
+
+    @triton.jit
+    def _add_stochastic_kernel(
+        input_ptr,            # pointer to bfloat16 in-place tensor (will be updated)
+        other_ptr,            # pointer to float32 'other'
+        alpha,                # float32 scalar multiplier
+        seed,                 # scalar seed
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Kernel that computes `other + alpha * input` (where input is bfloat16), then stochastically rounds
+        the result back into bfloat16 and stores it into input_ptr in-place.
+        Uses the same bit-level stochastic rounding approach as _copy_stochastic_kernel.
+        """
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offs = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offs < n_elements
+
+        # load input (bfloat16) and other (float32)
+        inp = tl.load(input_ptr + offs, mask=mask)
+        other = tl.load(other_ptr + offs, mask=mask)
+
+        # cast input to float32 to compute sum
+        inp_f = tl.cast(inp, tl.float32)
+        sum_val = other + inp_f * alpha
+
+        # bitcast sum_val to uint32
+        sum_bits = tl.cast(sum_val, tl.uint32, bitcast=True)
+
+        # random 16-bit int
+        rnd = tl.randint(seed, offs)
+        rnd16 = rnd & 0xFFFF
+
+        # add and clear low 16 bits
+        added = sum_bits + rnd16
+        rounded_bits = added & 0xFFFF0000
+
+        # bitcast back to float32
+        rounded = tl.cast(rounded_bits, tl.float32, bitcast=True)
+
+        # store back as bfloat16
+        out = tl.cast(rounded, tl.bfloat16)
+        tl.store(input_ptr + offs, out, mask=mask)
+
 except ImportError:
     HAS_TRITON = False
 
@@ -187,6 +272,8 @@ class CAME(Optimizer):
         )
         super(CAME, self).__init__(params, defaults)
 
+        backend = "triton" if HAS_TRITON else "python"
+
         print("\n==== CAME Modifications ====")
         if (
             enable_stochastic_rounding
@@ -195,7 +282,7 @@ class CAME(Optimizer):
             or enable_gc
         ):
             if enable_stochastic_rounding:
-                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}.")
+                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}, backend={backend}.")
                 self.stochastic_generators = {}
                 for stochastic_device in {p.device for group in self.param_groups for p in group["params"]}:
                     stochastic_generator = torch.Generator(device=stochastic_device)
@@ -204,8 +291,6 @@ class CAME(Optimizer):
             if enable_cautious:
                 print("- Cautious Masking enabled.")
             if enable_8bit:
-                self.use_triton = True if HAS_TRITON and triton_8bit else False
-                backend = "triton" if self.use_triton else "python"
                 print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}, backend={backend}.")
             if enable_gc:
                 print("- Garbage Collection enabled.")
@@ -242,7 +327,7 @@ class CAME(Optimizer):
         return torch.mul(r_factor, c_factor)
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/bf16_stochastic_rounding.py
-    def _copy_stochastic(self, target, source):
+    def _copy_stochastic_python(self, target, source):
         """
         Copies source into target using stochastic rounding
 
@@ -250,7 +335,7 @@ class CAME(Optimizer):
             target: the target tensor with dtype=bfloat16
             source: the target tensor with dtype=float32
         """
-        # create a random 16 bit integer
+        # create a random 16-bit integer
         result = torch.randint(
             size=source.shape,
             device=source.device,
@@ -272,7 +357,7 @@ class CAME(Optimizer):
         del result
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/bf16_stochastic_rounding.py
-    def _add_stochastic(self, input, other, alpha=1.0):
+    def _add_stochastic_python(self, input, other, alpha=1.0):
         """
         Adds other to input using stochastic rounding
 
@@ -288,7 +373,58 @@ class CAME(Optimizer):
         )
 
         result.add_(input, alpha=alpha)
-        self._copy_stochastic(input, result)
+        self._copy_stochastic_python(input, result)
+
+    def _copy_stochastic_triton(self, target, source):
+        n = source.numel()
+        if n == 0:
+            return
+
+        t_copy_stochastic_seed = torch.randint(
+            low=0,
+            high=2 ** 31,
+            size=(1,),
+            device=source.device,
+            generator=self.stochastic_generators[source.device]
+        )
+
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+        _copy_stochastic_kernel[grid](
+            target.flatten(),
+            source.flatten(),
+            int(t_copy_stochastic_seed.item()),
+            n,
+            BLOCK_SIZE=1024,
+        )
+
+    def _add_stochastic_triton(self, input, other, alpha=1.0):
+        n = input.numel()
+        if n == 0:
+            return
+
+        t_add_stochastic_seed = torch.randint(
+            low=0,
+            high=2 ** 31,
+            size=(1,),
+            device=input.device,
+            generator=self.stochastic_generators[input.device]
+        )
+
+        # ensure other is float32 contiguous
+        if other.dtype != torch.float32:
+            other_f = other.to(dtype=torch.float32)
+        else:
+            other_f = other
+
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+        _add_stochastic_kernel[grid](
+            input.flatten(),
+            other_f.flatten(),
+            float(alpha),
+            int(t_add_stochastic_seed.item()),
+            n,
+            BLOCK_SIZE=1024,
+        )
 
     # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
     def _quantize_state_python(self, state_tensor, block_size):
@@ -421,14 +557,15 @@ class CAME(Optimizer):
             # initialize first moment with optional 8-bit quantization
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
-            if use_8bit and self.use_triton:
-                (
-                    state["exp_avg"],
-                    state["exp_avg_scales"],
-                    state["exp_avg_mins"],
-                ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-            elif use_8bit:
-                state["exp_avg"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
+            if use_8bit:
+                if HAS_TRITON:
+                    (
+                        state["exp_avg"],
+                        state["exp_avg_scales"],
+                        state["exp_avg_mins"],
+                    ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
+                else:
+                    state["exp_avg"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
             else:
                 state["exp_avg"] = torch.zeros_like(grad)
 
@@ -438,14 +575,15 @@ class CAME(Optimizer):
                 state["exp_avg_res_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
-                if use_8bit and self.use_triton:
-                    (
-                        state["exp_avg_sq"],
-                        state["exp_avg_sq_scales"],
-                        state["exp_avg_sq_mins"],
-                    ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-                elif use_8bit:
-                    state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
+                if use_8bit:
+                    if HAS_TRITON:
+                        (
+                            state["exp_avg_sq"],
+                            state["exp_avg_sq_scales"],
+                            state["exp_avg_sq_mins"],
+                        ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
+                    else:
+                        state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
             state["RMS"] = 0
@@ -454,16 +592,17 @@ class CAME(Optimizer):
         state["RMS"] = self._rms(p.data)
 
         # load / dequantize first moment
-        if use_8bit and self.use_triton:
-            exp_avg = self._dequantize_state_triton(
-                state["exp_avg"],
-                state["exp_avg_scales"],
-                state["exp_avg_mins"],
-                grad_shape,
-                group["block_size"],
-            )
-        elif use_8bit:
-            exp_avg = self._dequantize_state_python(state["exp_avg"])
+        if use_8bit:
+            if HAS_TRITON:
+                exp_avg = self._dequantize_state_triton(
+                    state["exp_avg"],
+                    state["exp_avg_scales"],
+                    state["exp_avg_mins"],
+                    grad_shape,
+                    group["block_size"],
+                )
+            else:
+                exp_avg = self._dequantize_state_python(state["exp_avg"])
         else:
             exp_avg = state["exp_avg"]
 
@@ -480,27 +619,29 @@ class CAME(Optimizer):
             update.mul_(grad)
         else:
             # non-factored: update second moment, quantize if needed
-            if use_8bit and self.use_triton:
-                exp_avg_sq = self._dequantize_state_triton(
-                    state["exp_avg_sq"],
-                    state["exp_avg_sq_scales"],
-                    state["exp_avg_sq_mins"],
-                    grad_shape,
-                    group["block_size"],
-                )
-            elif use_8bit:
-                exp_avg_sq = self._dequantize_state_python(state["exp_avg_sq"])
+            if use_8bit:
+                if HAS_TRITON:
+                    exp_avg_sq = self._dequantize_state_triton(
+                        state["exp_avg_sq"],
+                        state["exp_avg_sq_scales"],
+                        state["exp_avg_sq_mins"],
+                        grad_shape,
+                        group["block_size"],
+                    )
+                else:
+                    exp_avg_sq = self._dequantize_state_python(state["exp_avg_sq"])
             else:
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
-            if use_8bit and self.use_triton:
-                (
-                    state["exp_avg_sq"],
-                    state["exp_avg_sq_scales"],
-                    state["exp_avg_sq_mins"],
-                ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
-            elif use_8bit:
-                state["exp_avg_sq"] = self._quantize_state_python(exp_avg_sq, group["block_size"])
+            if use_8bit:
+                if HAS_TRITON:
+                    (
+                        state["exp_avg_sq"],
+                        state["exp_avg_sq_scales"],
+                        state["exp_avg_sq_mins"],
+                    ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
+                else:
+                    state["exp_avg_sq"] = self._quantize_state_python(exp_avg_sq, group["block_size"])
             else:
                 state["exp_avg_sq"] = exp_avg_sq
             update = exp_avg_sq.rsqrt().mul_(grad)
@@ -510,14 +651,15 @@ class CAME(Optimizer):
         # update first moment
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
-        if use_8bit and self.use_triton:
-            (
-                state["exp_avg"],
-                state["exp_avg_scales"],
-                state["exp_avg_mins"],
-            ) = self._quantize_state_triton(exp_avg, group["block_size"])
-        elif use_8bit:
-            state["exp_avg"] = self._quantize_state_python(exp_avg, group["block_size"])
+        if use_8bit:
+            if HAS_TRITON:
+                (
+                    state["exp_avg"],
+                    state["exp_avg_scales"],
+                    state["exp_avg_mins"],
+                ) = self._quantize_state_triton(exp_avg, group["block_size"])
+            else:
+                state["exp_avg"] = self._quantize_state_python(exp_avg, group["block_size"])
         else:
             state["exp_avg"] = exp_avg
 
@@ -545,13 +687,19 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                self._add_stochastic(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+                if HAS_TRITON:
+                    self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+                else:
+                    self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
             else:
                 p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            self._add_stochastic(p.data, -update)
+            if HAS_TRITON:
+                self._add_stochastic_triton(p.data, -update)
+            else:
+                self._add_stochastic_python(p.data, -update)
         else:
             p.data.add_(-update)
 
