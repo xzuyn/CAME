@@ -8,6 +8,7 @@ from torch.optim import Optimizer
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 
     @triton.jit
@@ -25,7 +26,7 @@ try:
 
         block_start = pid * QUANT_BLOCK_SIZE
         offsets = block_start + tl.arange(0, QUANT_BLOCK_SIZE)
-        
+
         block_vals = tl.load(input_ptr + offsets, eviction_policy="evict_first")
 
         block_min = tl.min(block_vals, axis=0)
@@ -49,16 +50,17 @@ try:
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
-        
+
         quant_block_idx = offsets // QUANT_BLOCK_SIZE
 
         scale = tl.load(scale_ptr + quant_block_idx, mask=mask)
         min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
-        
+
         input_vals = tl.load(input_ptr + offsets, mask=mask)
-        
+
         quantized_vals = ((input_vals - min_val) / scale) * 255.0
-        quantized_vals = quantized_vals + 0.5  # TODO: Replace with triton round or stochastic round
+        # TODO: Replace with triton round or stochastic round
+        quantized_vals = quantized_vals + 0.5
         
         quantized_vals = tl.where(quantized_vals > 255.0, 255.0, quantized_vals)
         quantized_vals = tl.where(quantized_vals < 0.0, 0.0, quantized_vals)
@@ -88,10 +90,11 @@ try:
         min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
 
         quantized_data = tl.load(data_ptr + offsets, mask=mask)
-        
+
         dequantized_data = (quantized_data.to(tl.float32) / 255.0) * scale + min_val
 
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
+
 except ImportError:
     HAS_TRITON = False
 
@@ -175,7 +178,7 @@ class CAME(Optimizer):
             if enable_stochastic_rounding:
                 print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}.")
                 self.stochastic_generators = {}
-                for stochastic_device in {p.device for group in self.param_groups for p in group['params']}:
+                for stochastic_device in {p.device for group in self.param_groups for p in group["params"]}:
                     stochastic_generator = torch.Generator(device=stochastic_device)
                     stochastic_generator.manual_seed(torch.initial_seed())
                     self.stochastic_generators[stochastic_device] = stochastic_generator
@@ -223,7 +226,7 @@ class CAME(Optimizer):
     def _copy_stochastic(self, target, source):
         """
         Copies source into target using stochastic rounding
-    
+
         Args:
             target: the target tensor with dtype=bfloat16
             source: the target tensor with dtype=float32
@@ -259,7 +262,11 @@ class CAME(Optimizer):
             other: the other tensor
             alpha: a multiplier for other
         """
-        result = other.clone() if other.dtype == torch.float32 else other.to(dtype=torch.float32)
+        result = (
+            other.clone()
+            if other.dtype == torch.float32
+            else other.to(dtype=torch.float32)
+        )
 
         result.add_(input, alpha=alpha)
         self._copy_stochastic(input, result)
@@ -296,26 +303,48 @@ class CAME(Optimizer):
         maxs = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
 
         grid = lambda meta: (num_quant_blocks,)
-        _get_block_stats_kernel[grid](state_tensor.flatten(), mins, maxs, num_quant_blocks, QUANT_BLOCK_SIZE=block_size)
-        
+        _get_block_stats_kernel[grid](
+            state_tensor.flatten(),
+            mins,
+            maxs,
+            num_quant_blocks,
+            QUANT_BLOCK_SIZE=block_size,
+        )
+
         scales = maxs - mins
         output_data = torch.empty_like(state_tensor, dtype=torch.uint8).flatten()
-        
-        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-        _quantize_kernel[grid](output_data, state_tensor.flatten(), scales, mins, n_elements, BLOCK_SIZE=1024, QUANT_BLOCK_SIZE=block_size)
+
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        _quantize_kernel[grid](
+            output_data,
+            state_tensor.flatten(),
+            scales,
+            mins,
+            n_elements,
+            BLOCK_SIZE=1024,
+            QUANT_BLOCK_SIZE=block_size,
+        )
 
         return output_data.reshape(state_tensor.shape), scales, mins
 
     def _dequantize_state_triton(self, state_data, scales, mins, original_shape, block_size):
         if state_data is None:
             return None
-            
+
         n_elements = state_data.numel()
         output = torch.empty(original_shape, dtype=torch.float32, device=state_data.device)
         
-        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-        _dequantize_kernel[grid](output.flatten(), state_data.flatten(), scales, mins, n_elements, BLOCK_SIZE=1024, QUANT_BLOCK_SIZE=block_size)
-        
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        _dequantize_kernel[grid](
+            output.flatten(),
+            state_data.flatten(),
+            scales,
+            mins,
+            n_elements,
+            BLOCK_SIZE=1024,
+            QUANT_BLOCK_SIZE=block_size,
+        )
+
         return output
 
     # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
@@ -374,7 +403,11 @@ class CAME(Optimizer):
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
             if use_8bit and self.use_triton:
-                state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"] = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
+                (
+                    state["exp_avg"],
+                    state["exp_avg_scales"],
+                    state["exp_avg_mins"],
+                ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
             elif use_8bit:
                 state["exp_avg"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
             else:
@@ -387,7 +420,11 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_8bit and self.use_triton:
-                    state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"] = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
+                    (
+                        state["exp_avg_sq"],
+                        state["exp_avg_sq_scales"],
+                        state["exp_avg_sq_mins"],
+                    ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
                 elif use_8bit:
                     state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
                 else:
@@ -399,7 +436,13 @@ class CAME(Optimizer):
 
         # load / dequantize first moment
         if use_8bit and self.use_triton:
-            exp_avg = self._dequantize_state_triton(state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"], grad_shape, group["block_size"])
+            exp_avg = self._dequantize_state_triton(
+                state["exp_avg"],
+                state["exp_avg_scales"],
+                state["exp_avg_mins"],
+                grad_shape,
+                group["block_size"],
+            )
         elif use_8bit:
             exp_avg = self._dequantize_state_python(state["exp_avg"])
         else:
@@ -419,14 +462,24 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment, quantize if needed
             if use_8bit and self.use_triton:
-                exp_avg_sq = self._dequantize_state_triton(state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"], grad_shape, group["block_size"])
+                exp_avg_sq = self._dequantize_state_triton(
+                    state["exp_avg_sq"],
+                    state["exp_avg_sq_scales"],
+                    state["exp_avg_sq_mins"],
+                    grad_shape,
+                    group["block_size"],
+                )
             elif use_8bit:
                 exp_avg_sq = self._dequantize_state_python(state["exp_avg_sq"])
             else:
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
             if use_8bit and self.use_triton:
-                state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"] = self._quantize_state_triton(exp_avg_sq, group["block_size"])
+                (
+                    state["exp_avg_sq"],
+                    state["exp_avg_sq_scales"],
+                    state["exp_avg_sq_mins"],
+                ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
             elif use_8bit:
                 state["exp_avg_sq"] = self._quantize_state_python(exp_avg_sq, group["block_size"])
             else:
@@ -439,7 +492,11 @@ class CAME(Optimizer):
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
         if use_8bit and self.use_triton:
-            state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"] = self._quantize_state_triton(exp_avg, group["block_size"])
+            (
+                state["exp_avg"],
+                state["exp_avg_scales"],
+                state["exp_avg_mins"],
+            ) = self._quantize_state_triton(exp_avg, group["block_size"])
         elif use_8bit:
             state["exp_avg"] = self._quantize_state_python(exp_avg, group["block_size"])
         else:
@@ -447,7 +504,7 @@ class CAME(Optimizer):
 
         # Confidence-guided strategy
         # Calculation of instability
-        res = (update - exp_avg)**2 + group["eps"][1]
+        res = (update - exp_avg) ** 2 + group["eps"][1]
 
         if factored:
             exp_avg_res_row = state["exp_avg_res_row"]
