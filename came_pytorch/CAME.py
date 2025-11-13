@@ -687,7 +687,7 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if HAS_TRITON:
+                if HAS_TRITON and p.numel() >= (16384 * 1024):
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
@@ -696,7 +696,7 @@ class CAME(Optimizer):
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if HAS_TRITON:
+            if HAS_TRITON and p.numel() >= (16384 * 1024):
                 self._add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_python(p.data, -update)
