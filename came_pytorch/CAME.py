@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from torch.optim import Optimizer
 
-HAS_TRITON = False
 try:
     import triton
     import triton.language as tl
@@ -183,7 +182,8 @@ class CAME(Optimizer):
             if enable_cautious:
                 print("- Cautious Masking enabled.")
             if enable_8bit:
-                backend = "triton" if HAS_TRITON and triton_8bit else "python"
+                self.use_triton = True if HAS_TRITON and triton_8bit else False
+                backend = "triton" if self.use_triton else "python"
                 print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}, backend={backend}.")
             if enable_gc:
                 print("- Garbage Collection enabled.")
@@ -373,7 +373,7 @@ class CAME(Optimizer):
             # initialize first moment with optional 8-bit quantization
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
-            if use_8bit and HAS_TRITON and group["triton_8bit"]:
+            if use_8bit and self.use_triton:
                 state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"] = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
             elif use_8bit:
                 state["exp_avg"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
@@ -386,7 +386,7 @@ class CAME(Optimizer):
                 state["exp_avg_res_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
-                if use_8bit and HAS_TRITON and group["triton_8bit"]:
+                if use_8bit and self.use_triton:
                     state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"] = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
                 elif use_8bit:
                     state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
@@ -398,7 +398,7 @@ class CAME(Optimizer):
         state["RMS"] = self._rms(p.data)
 
         # load / dequantize first moment
-        if use_8bit and HAS_TRITON and group["triton_8bit"]:
+        if use_8bit and self.use_triton:
             exp_avg = self._dequantize_state_triton(state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"], grad_shape, group["block_size"])
         elif use_8bit:
             exp_avg = self._dequantize_state_python(state["exp_avg"])
@@ -418,14 +418,14 @@ class CAME(Optimizer):
             update.mul_(grad)
         else:
             # non-factored: update second moment, quantize if needed
-            if use_8bit and HAS_TRITON and group["triton_8bit"]:
+            if use_8bit and self.use_triton:
                 exp_avg_sq = self._dequantize_state_triton(state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"], grad_shape, group["block_size"])
             elif use_8bit:
                 exp_avg_sq = self._dequantize_state_python(state["exp_avg_sq"])
             else:
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
-            if use_8bit and HAS_TRITON and group["triton_8bit"]:
+            if use_8bit and self.use_triton:
                 state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"] = self._quantize_state_triton(exp_avg_sq, group["block_size"])
             elif use_8bit:
                 state["exp_avg_sq"] = self._quantize_state_python(exp_avg_sq, group["block_size"])
@@ -438,7 +438,7 @@ class CAME(Optimizer):
         # update first moment
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
-        if use_8bit and HAS_TRITON and group["triton_8bit"]:
+        if use_8bit and self.use_triton:
             state["exp_avg"], state["exp_avg_scales"], state["exp_avg_mins"] = self._quantize_state_triton(exp_avg, group["block_size"])
         elif use_8bit:
             state["exp_avg"] = self._quantize_state_python(exp_avg, group["block_size"])
