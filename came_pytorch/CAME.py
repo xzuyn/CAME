@@ -1,6 +1,4 @@
-import math
 import gc
-
 import numpy as np
 import torch
 from torch.optim import Optimizer
@@ -244,7 +242,6 @@ class CAME(Optimizer):
         enable_stochastic_rounding=False,
         enable_cautious=False,
         enable_8bit=False,
-        triton_8bit=True,
         block_size=2048,
         min_8bit_size=16384,
         quiet_8bit=True,
@@ -264,7 +261,6 @@ class CAME(Optimizer):
             enable_stochastic_rounding=enable_stochastic_rounding,
             enable_cautious=enable_cautious,
             enable_8bit=enable_8bit,
-            triton_8bit=triton_8bit,
             block_size=block_size,
             min_8bit_size=min_8bit_size,
             quiet_8bit=quiet_8bit,
@@ -687,7 +683,7 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if HAS_TRITON and p.numel() >= (16384 * 1024):
+                if HAS_TRITON and p.numel() >= 16_777_216:
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
@@ -696,7 +692,7 @@ class CAME(Optimizer):
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if HAS_TRITON and p.numel() >= (16384 * 1024):
+            if HAS_TRITON and p.numel() >= 16_777_216:
                 self._add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_python(p.data, -update)
