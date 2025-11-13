@@ -389,7 +389,7 @@ class CAME(Optimizer):
                 if use_8bit and HAS_TRITON and group["triton_8bit"]:
                     state["exp_avg_sq"], state["exp_avg_sq_scales"], state["exp_avg_sq_mins"] = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
                 elif use_8bit:
-                    state["exp_avg_sq"] = self._quantize_state(torch.zeros_like(grad), group["block_size"])
+                    state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
             state["RMS"] = 0
