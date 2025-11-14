@@ -6,6 +6,14 @@ import torch
 from torch.optim import Optimizer
 
 try:
+    from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
+
+    HAS_BNB = True
+
+except ImportError:
+    HAS_BNB = False
+
+try:
     import triton
     import triton.language as tl
 
@@ -270,7 +278,13 @@ class CAME(Optimizer):
         )
         super(CAME, self).__init__(params, defaults)
 
-        backend = "triton" if HAS_TRITON else "python"
+        if HAS_TRITON:
+            stochastic_backend, quant_backend = "triton", "triton"
+        else:
+            stochastic_backend, quant_backend = "python", "python"
+
+        if HAS_BNB:
+            quant_backend = "bnb"
 
         print("\n==== CAME Modifications ====")
         if (
@@ -280,7 +294,7 @@ class CAME(Optimizer):
             or enable_gc
         ):
             if enable_stochastic_rounding:
-                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}, backend={backend}.")
+                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}, backend={stochastic_backend}.")
                 self.stochastic_generators = {}
                 for stochastic_device in {p.device for group in self.param_groups for p in group["params"]}:
                     stochastic_generator = torch.Generator(device=stochastic_device)
@@ -289,7 +303,7 @@ class CAME(Optimizer):
             if enable_cautious:
                 print("- Cautious Masking enabled.")
             if enable_8bit:
-                print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}, backend={backend}.")
+                print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}, backend={quant_backend}.")
             if enable_gc:
                 print("- Garbage Collection enabled.")
         else:
@@ -556,7 +570,9 @@ class CAME(Optimizer):
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
             if use_8bit:
-                if HAS_TRITON:
+                if HAS_BNB:
+                    state["exp_avg"] = quantize_blockwise(torch.zeros_like(grad))
+                elif HAS_TRITON:
                     (
                         state["exp_avg"],
                         state["exp_avg_scales"],
@@ -574,7 +590,9 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_8bit:
-                    if HAS_TRITON:
+                    if HAS_BNB:
+                        state["exp_avg_sq"] = quantize_blockwise(torch.zeros_like(grad))
+                    elif HAS_TRITON:
                         (
                             state["exp_avg_sq"],
                             state["exp_avg_sq_scales"],
@@ -591,7 +609,9 @@ class CAME(Optimizer):
 
         # load / dequantize first moment
         if use_8bit:
-            if HAS_TRITON:
+            if HAS_BNB:
+                exp_avg = dequantize_blockwise(state["exp_avg"])
+            elif HAS_TRITON:
                 exp_avg = self._dequantize_state_triton(
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -618,7 +638,9 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment, quantize if needed
             if use_8bit:
-                if HAS_TRITON:
+                if HAS_BNB:
+                    exp_avg_sq = dequantize_blockwise(state["exp_avg_sq"])
+                elif HAS_TRITON:
                     exp_avg_sq = self._dequantize_state_triton(
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -632,7 +654,9 @@ class CAME(Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
             if use_8bit:
-                if HAS_TRITON:
+                if HAS_BNB:
+                    state["exp_avg_sq"] = quantize_blockwise(exp_avg_sq)
+                elif HAS_TRITON:
                     (
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -650,7 +674,9 @@ class CAME(Optimizer):
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
         if use_8bit:
-            if HAS_TRITON:
+            if HAS_BNB:
+                state["exp_avg"] = quantize_blockwise(exp_avg)
+            elif HAS_TRITON:
                 (
                     state["exp_avg"],
                     state["exp_avg_scales"],
