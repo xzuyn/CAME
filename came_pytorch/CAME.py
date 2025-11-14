@@ -1,3 +1,5 @@
+# TODO: Compare python and triton 8bit methods to bitsandbytes blockwise
+
 import gc
 import numpy as np
 import torch
