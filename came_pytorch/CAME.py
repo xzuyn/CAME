@@ -1,4 +1,5 @@
 # TODO: Compare python and triton 8bit methods to bitsandbytes blockwise
+# TODO: Try quantize_4bit
 
 import gc
 import numpy as np
@@ -252,7 +253,7 @@ class CAME(Optimizer):
         enable_stochastic_rounding=False,
         enable_cautious=False,
         enable_8bit=False,
-        block_size=2048,
+        block_size=256,
         min_8bit_size=16384,
         quiet_8bit=True,
         enable_gc=False,
@@ -318,13 +319,20 @@ class CAME(Optimizer):
     def supports_flat_params(self):
         return False
 
+    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L523C1-L535C55
     def _should_use_8bit(self, param_shape):
-        """Determines whether parameters should be quantized to 8-bit based on size and layer type"""
-        if len(param_shape) == 2:  # Linear layers
+        """Determine if a parameter should be quantized to 8bit
+
+        Rules:
+        1. linear layers: parameter size > min_8bit_size
+        2. 1x1 conv layers: parameter size > min_8bit_size
+        3. other layers: use 32bit
+        """
+        if len(param_shape) == 2:  # linear layer
             return param_shape[0] * param_shape[1] > self.defaults["min_8bit_size"]
-        elif len(param_shape) == 4 and param_shape[2] == 1 and param_shape[3] == 1:  # 1x1 conv
+        elif len(param_shape) == 4 and param_shape[2] == 1 and param_shape[3] == 1:
             return param_shape[0] * param_shape[1] > self.defaults["min_8bit_size"]
-        return False
+        return False  # other layers are not quantized
 
     def _rms(self, tensor):
         return tensor.norm(2) / (tensor.numel() ** 0.5)
@@ -438,28 +446,51 @@ class CAME(Optimizer):
             BLOCK_SIZE=1024,
         )
 
-    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
+    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
     def _quantize_state_python(self, state_tensor, block_size):
-        """Quantizes the state tensor to 8-bit with simple min-max per block"""
+        """Quantize a state tensor to 8bit
+
+        Args:
+            state_tensor: tensor to be quantized
+            block_size: quantization block size
+
+        Returns:
+            list of quantized data blocks, each block contains:
+            - data: uint8 data
+            - scale: quantization scale
+            - min: minimum value
+        """
         if state_tensor.numel() <= 1:
             return state_tensor
+
         quantized_chunks = []
         for chunk in state_tensor.split(block_size):
+            # Calculate quantization parameters
             chunk_min = chunk.min()
             chunk_max = chunk.max()
             scale = (chunk_max - chunk_min) / 255
-            quantized_data = ((chunk - chunk_min) / scale).round().byte()
-            quantized_chunks.append({"data": quantized_data, "scale": scale, "min": chunk_min})
+
+            # Quantize to 0-255 range
+            quantized_chunks.append({"data": ((chunk - chunk_min) / scale).round().byte(), "scale": scale, "min": chunk_min})
         return quantized_chunks
 
-    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
+    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
     def _dequantize_state_python(self, quantized_chunks):
-        """Dequantizes quantized chunks back to float32"""
+        """Dequantize 8bit quantized data to 32bit float
+
+        Args:
+            quantized_chunks: list of quantized data blocks
+
+        Returns:
+            dequantized 32bit float tensor
+        """
         if not isinstance(quantized_chunks, list):
             return quantized_chunks
+
         chunks = []
-        for c in quantized_chunks:
-            chunks.append(c["data"].float() * c["scale"] + c["min"])
+        for chunk_dict in quantized_chunks:
+            # Dequantize: value = data * scale + min
+            chunks.append(chunk_dict["data"].float() * chunk_dict["scale"] + chunk_dict["min"])
         return torch.cat(chunks)
 
     def _quantize_state_triton(self, state_tensor, block_size):
@@ -514,7 +545,7 @@ class CAME(Optimizer):
 
         return output
 
-    # https://github.com/NVlabs/Sana/blob/main/diffusion/utils/optimizer.py
+    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L501C1-L521C97
     def print_layer_info(self, param_shape, use_8bit):
         size = np.prod(param_shape)
         layer_type = "unknown"
