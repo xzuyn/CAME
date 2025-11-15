@@ -204,7 +204,7 @@ except ImportError:
 
 try:
     if HAS_TRITON:
-        from bitsandbytes.triton.ops import  quantize_blockwise, dequantize_blockwise
+        from bitsandbytes.triton.ops import quantize_blockwise, dequantize_blockwise
     else:
         from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
     HAS_BNB = True
