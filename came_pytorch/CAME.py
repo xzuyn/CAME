@@ -11,8 +11,6 @@ try:
     import triton
     import triton.language as tl
 
-    HAS_TRITON = True
-
     @triton.jit
     def _get_block_stats_kernel(
         input_ptr,
@@ -200,6 +198,7 @@ try:
         # store back as bfloat16
         out = tl.cast(rounded, tl.bfloat16)
         tl.store(input_ptr + offs, out, mask=mask)
+    HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
 
