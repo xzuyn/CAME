@@ -6,16 +6,6 @@ import numpy as np
 import torch
 from torch.optim import Optimizer
 
-try:
-    from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
-    # from bitsandbytes.triton.ops import  quantize_blockwise, dequantize_blockwise
-
-    HAS_BNB = True
-
-except ImportError:
-    HAS_BNB = False
-
-# HAS_BNB = False
 
 try:
     import triton
@@ -210,9 +200,17 @@ try:
         # store back as bfloat16
         out = tl.cast(rounded, tl.bfloat16)
         tl.store(input_ptr + offs, out, mask=mask)
-
 except ImportError:
     HAS_TRITON = False
+
+try:
+    if HAS_TRITON:
+        from bitsandbytes.triton.ops import  quantize_blockwise, dequantize_blockwise
+    else:
+        from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
+    HAS_BNB = True
+except ImportError:
+    HAS_BNB = False
 
 
 class CAME(Optimizer):
@@ -254,8 +252,10 @@ class CAME(Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         enable_stochastic_rounding=False,
+        stochastic_backend="python",
         enable_cautious=False,
         enable_8bit=False,
+        quant_backend="python",
         block_size=256,
         min_8bit_size=16384,
         quiet_8bit=True,
@@ -265,6 +265,14 @@ class CAME(Optimizer):
 
         assert lr > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
+        assert stochastic_backend in ["python", "triton"]
+        assert quant_backend in ["python", "triton", "bnb", "triton_bnb"]
+        if stochastic_backend == "triton":
+            assert HAS_TRITON is True
+        if quant_backend in ["triton", "triton_bnb"]:
+            assert HAS_TRITON is True
+        if quant_backend in ["bnb", "triton_bnb"]:
+            assert HAS_BNB is True
 
         defaults = dict(
             lr=lr,
@@ -273,22 +281,16 @@ class CAME(Optimizer):
             betas=betas,
             weight_decay=weight_decay,
             enable_stochastic_rounding=enable_stochastic_rounding,
+            stochastic_backend=stochastic_backend,
             enable_cautious=enable_cautious,
             enable_8bit=enable_8bit,
+            quant_backend=quant_backend,
             block_size=block_size,
             min_8bit_size=min_8bit_size,
             quiet_8bit=quiet_8bit,
             enable_gc=enable_gc,
         )
         super(CAME, self).__init__(params, defaults)
-
-        if HAS_TRITON:
-            stochastic_backend, quant_backend = "triton", "triton"
-        else:
-            stochastic_backend, quant_backend = "python", "python"
-
-        if HAS_BNB:
-            quant_backend = "bnb"
 
         print("\n==== CAME Modifications ====")
         if (
@@ -604,9 +606,9 @@ class CAME(Optimizer):
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
             if use_8bit:
-                if HAS_BNB:
+                if self.quant_backend in ["bnb", "triton_bnb"]:
                     state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                elif HAS_TRITON:
+                elif self.quant_backend == "triton":
                     (
                         state["exp_avg"],
                         state["exp_avg_scales"],
@@ -624,9 +626,9 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_8bit:
-                    if HAS_BNB:
+                    if self.quant_backend in ["bnb", "triton_bnb"]:
                         state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                    elif HAS_TRITON:
+                    elif self.quant_backend == "triton":
                         (
                             state["exp_avg_sq"],
                             state["exp_avg_sq_scales"],
@@ -643,9 +645,9 @@ class CAME(Optimizer):
 
         # load / dequantize first moment
         if use_8bit:
-            if HAS_BNB:
+            if self.quant_backend in ["bnb", "triton_bnb"]:
                 exp_avg = dequantize_blockwise(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-            elif HAS_TRITON:
+            elif self.quant_backend == "triton":
                 exp_avg = self._dequantize_state_triton(
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -672,9 +674,9 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment, quantize if needed
             if use_8bit:
-                if HAS_BNB:
+                if self.quant_backend in ["bnb", "triton_bnb"]:
                     exp_avg_sq = dequantize_blockwise(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-                elif HAS_TRITON:
+                elif self.quant_backend == "triton":
                     exp_avg_sq = self._dequantize_state_triton(
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -688,9 +690,9 @@ class CAME(Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
             if use_8bit:
-                if HAS_BNB:
+                if self.quant_backend in ["bnb", "triton_bnb"]:
                     state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_blockwise(exp_avg_sq, blocksize=group["block_size"])
-                elif HAS_TRITON:
+                elif self.quant_backend == "triton":
                     (
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -708,9 +710,9 @@ class CAME(Optimizer):
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
         if use_8bit:
-            if HAS_BNB:
+            if self.quant_backend in ["bnb", "triton_bnb"]:
                 state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
-            elif HAS_TRITON:
+            elif self.quant_backend == "triton":
                 (
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -745,7 +747,7 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if HAS_TRITON and p.numel() >= 16_777_216:
+                if self.stochastic_backend == "triton" and p.numel() >= 16_777_216:
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
@@ -754,7 +756,7 @@ class CAME(Optimizer):
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if HAS_TRITON and p.numel() >= 16_777_216:
+            if self.stochastic_backend == "triton" and p.numel() >= 16_777_216:
                 self._add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_python(p.data, -update)
