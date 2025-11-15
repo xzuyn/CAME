@@ -605,9 +605,9 @@ class CAME(Optimizer):
             if not group["quiet_8bit"]:
                 self.print_layer_info(grad_shape, use_8bit)
             if use_8bit:
-                if self.quant_backend in ["bnb", "triton_bnb"]:
+                if group["quant_backend"] in ["bnb", "triton_bnb"]:
                     state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                elif self.quant_backend == "triton":
+                elif group["quant_backend"] == "triton":
                     (
                         state["exp_avg"],
                         state["exp_avg_scales"],
@@ -625,9 +625,9 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_8bit:
-                    if self.quant_backend in ["bnb", "triton_bnb"]:
+                    if group["quant_backend"] in ["bnb", "triton_bnb"]:
                         state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                    elif self.quant_backend == "triton":
+                    elif group["quant_backend"] == "triton":
                         (
                             state["exp_avg_sq"],
                             state["exp_avg_sq_scales"],
@@ -644,9 +644,9 @@ class CAME(Optimizer):
 
         # load / dequantize first moment
         if use_8bit:
-            if self.quant_backend in ["bnb", "triton_bnb"]:
+            if group["quant_backend"] in ["bnb", "triton_bnb"]:
                 exp_avg = dequantize_blockwise(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-            elif self.quant_backend == "triton":
+            elif group["quant_backend"] == "triton":
                 exp_avg = self._dequantize_state_triton(
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -673,9 +673,9 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment, quantize if needed
             if use_8bit:
-                if self.quant_backend in ["bnb", "triton_bnb"]:
+                if group["quant_backend"] in ["bnb", "triton_bnb"]:
                     exp_avg_sq = dequantize_blockwise(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-                elif self.quant_backend == "triton":
+                elif group["quant_backend"] == "triton":
                     exp_avg_sq = self._dequantize_state_triton(
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -689,9 +689,9 @@ class CAME(Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
             if use_8bit:
-                if self.quant_backend in ["bnb", "triton_bnb"]:
+                if group["quant_backend"] in ["bnb", "triton_bnb"]:
                     state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_blockwise(exp_avg_sq, blocksize=group["block_size"])
-                elif self.quant_backend == "triton":
+                elif group["quant_backend"] == "triton":
                     (
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -709,9 +709,9 @@ class CAME(Optimizer):
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
         # re-quantize first moment if using 8bit
         if use_8bit:
-            if self.quant_backend in ["bnb", "triton_bnb"]:
+            if group["quant_backend"] in ["bnb", "triton_bnb"]:
                 state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
-            elif self.quant_backend == "triton":
+            elif group["quant_backend"] == "triton":
                 (
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -746,7 +746,7 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if self.stochastic_backend == "triton" and p.numel() >= 16_777_216:
+                if group["stochastic_backend"] == "triton" and p.numel() >= 16_777_216:
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
@@ -755,7 +755,7 @@ class CAME(Optimizer):
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if self.stochastic_backend == "triton" and p.numel() >= 16_777_216:
+            if group["stochastic_backend"] == "triton" and p.numel() >= 16_777_216:
                 self._add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_python(p.data, -update)
