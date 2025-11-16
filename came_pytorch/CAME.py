@@ -209,10 +209,10 @@ class CAME(Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         enable_stochastic_rounding=False,
-        stochastic_backend="python",
+        stochastic_backend="pytorch",
         enable_cautious=False,
         enable_8bit=False,
-        quant_backend="python",
+        quant_backend="pytorch",
         block_size=256,
         min_8bit_size=16384,
         quiet_8bit=True,
@@ -222,8 +222,8 @@ class CAME(Optimizer):
 
         assert lr > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
-        assert stochastic_backend in ["python", "triton"]
-        assert quant_backend in ["python", "triton", "bnb"]
+        assert stochastic_backend in ["pytorch", "triton"]
+        assert quant_backend in ["pytorch", "triton", "bnb"]
         if stochastic_backend == "triton" or quant_backend == "triton":
             assert HAS_TRITON is True
         if quant_backend == "bnb":
@@ -308,7 +308,7 @@ class CAME(Optimizer):
         return torch.mul(r_factor, c_factor)
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/bf16_stochastic_rounding.py
-    def _copy_stochastic_python(self, target, source):
+    def _copy_stochastic_pytorch(self, target, source):
         """
         Copies source into target using stochastic rounding
 
@@ -338,7 +338,7 @@ class CAME(Optimizer):
         del result
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/bf16_stochastic_rounding.py
-    def _add_stochastic_python(self, input, other, alpha=1.0):
+    def _add_stochastic_pytorch(self, input, other, alpha=1.0):
         """
         Adds other to input using stochastic rounding
 
@@ -354,32 +354,31 @@ class CAME(Optimizer):
         )
 
         result.add_(input, alpha=alpha)
-        self._copy_stochastic_python(input, result)
+        self._copy_stochastic_pytorch(input, result)
 
     def _add_stochastic_triton(self, input, other, alpha=1.0):
         n = input.numel()
         if n == 0:
             return
 
-        result = (
+        other = (
             other.clone()
             if other.dtype == torch.float32
             else other.to(dtype=torch.float32)
         )
-        del other
-        assert result.is_contiguous()
+        assert other.is_contiguous()
 
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
         add_stochastic_kernel[grid](
             input.flatten(),
-            result.flatten(),
+            other.flatten(),
             float(alpha),
             n,
             BLOCK_SIZE=1024,
         )
 
     # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
-    def _quantize_state_python(self, state_tensor, block_size):
+    def _quantize_state_pytorch(self, state_tensor, block_size):
         """Quantize a state tensor to 8bit
 
         Args:
@@ -407,7 +406,7 @@ class CAME(Optimizer):
         return quantized_chunks
 
     # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
-    def _dequantize_state_python(self, quantized_chunks):
+    def _dequantize_state_pytorch(self, quantized_chunks):
         """Dequantize 8bit quantized data to 32bit float
 
         Args:
@@ -542,7 +541,7 @@ class CAME(Optimizer):
                         state["exp_avg_mins"],
                     ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
                 else:
-                    state["exp_avg"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
+                    state["exp_avg"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
             else:
                 state["exp_avg"] = torch.zeros_like(grad)
 
@@ -562,7 +561,7 @@ class CAME(Optimizer):
                             state["exp_avg_sq_mins"],
                         ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
                     else:
-                        state["exp_avg_sq"] = self._quantize_state_python(torch.zeros_like(grad), group["block_size"])
+                        state["exp_avg_sq"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
             state["RMS"] = 0
@@ -583,7 +582,7 @@ class CAME(Optimizer):
                     group["block_size"],
                 )
             else:
-                exp_avg = self._dequantize_state_python(state["exp_avg"])
+                exp_avg = self._dequantize_state_pytorch(state["exp_avg"])
         else:
             exp_avg = state["exp_avg"]
 
@@ -612,7 +611,7 @@ class CAME(Optimizer):
                         group["block_size"],
                     )
                 else:
-                    exp_avg_sq = self._dequantize_state_python(state["exp_avg_sq"])
+                    exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"])
             else:
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
@@ -626,7 +625,7 @@ class CAME(Optimizer):
                         state["exp_avg_sq_mins"],
                     ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
                 else:
-                    state["exp_avg_sq"] = self._quantize_state_python(exp_avg_sq, group["block_size"])
+                    state["exp_avg_sq"] = self._quantize_state_pytorch(exp_avg_sq, group["block_size"])
             else:
                 state["exp_avg_sq"] = exp_avg_sq
             update = exp_avg_sq.rsqrt().mul_(grad)
@@ -646,7 +645,7 @@ class CAME(Optimizer):
                     state["exp_avg_mins"],
                 ) = self._quantize_state_triton(exp_avg, group["block_size"])
             else:
-                state["exp_avg"] = self._quantize_state_python(exp_avg, group["block_size"])
+                state["exp_avg"] = self._quantize_state_pytorch(exp_avg, group["block_size"])
         else:
             state["exp_avg"] = exp_avg
 
@@ -677,7 +676,7 @@ class CAME(Optimizer):
                 if group["stochastic_backend"] == "triton":
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
-                    self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+                    self._add_stochastic_pytorch(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
             else:
                 p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
 
@@ -686,7 +685,7 @@ class CAME(Optimizer):
             if group["stochastic_backend"] == "triton":
                 self._add_stochastic_triton(p.data, -update)
             else:
-                self._add_stochastic_python(p.data, -update)
+                self._add_stochastic_pytorch(p.data, -update)
         else:
             p.data.add_(-update)
 
