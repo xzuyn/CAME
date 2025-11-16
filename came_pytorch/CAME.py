@@ -112,67 +112,25 @@ try:
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
 
     @triton.jit
-    def _copy_stochastic_kernel(
-        target_ptr,           # pointer to bfloat16 output
-        source_ptr,           # pointer to float32 input
-        seed,                 # scalar seed
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """
-        Kernel that implements stochastic rounding of float32 'source' into bfloat16 'target'.
-        The strategy mirrors the CPU implementation: bitcast float32 -> uint32, add a uniform
-        16-bit random integer to the low 16 bits, mask-off the low 16 bits, bitcast back to float32,
-        then store as bfloat16.
-        """
-        pid = tl.program_id(axis=0)
-        block_start = pid * BLOCK_SIZE
-        offs = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < n_elements
-
-        # load source (float32)
-        src = tl.load(source_ptr + offs, mask=mask)
-
-        # bitcast float32 -> uint32
-        src_bits = tl.cast(src, tl.uint32, bitcast=True)
-
-        # generate random int32 per element and reduce to 16 bits
-        rnd = tl.randint(seed, offs)
-        rnd16 = rnd & 0xFFFF
-
-        # add rnd to low bits and clear low 16 bits to simulate stochastic rounding
-        added = src_bits + rnd16
-        rounded_bits = added & 0xFFFF0000
-
-        # bitcast back to float32
-        rounded = tl.cast(rounded_bits, tl.float32, bitcast=True)
-
-        # store as bfloat16 (numeric cast)
-        out = tl.cast(rounded, tl.bfloat16)
-        tl.store(target_ptr + offs, out, mask=mask)
-
-    @triton.jit
     def _add_stochastic_kernel(
         input_ptr,            # pointer to bfloat16 in-place tensor (will be updated)
         other_ptr,            # pointer to float32 'other'
         alpha,                # float32 scalar multiplier
-        seed,                 # scalar seed
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
         """
         Kernel that computes `other + alpha * input` (where input is bfloat16), then stochastically rounds
         the result back into bfloat16 and stores it into input_ptr in-place.
-        Uses the same bit-level stochastic rounding approach as _copy_stochastic_kernel.
         """
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
-        offs = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offs < n_elements
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
 
         # load input (bfloat16) and other (float32)
-        inp = tl.load(input_ptr + offs, mask=mask)
-        other = tl.load(other_ptr + offs, mask=mask)
+        inp = tl.load(input_ptr + offsets, mask=mask)
+        other = tl.load(other_ptr + offsets, mask=mask)
 
         # cast input to float32 to compute sum
         inp_f = tl.cast(inp, tl.float32)
@@ -182,7 +140,7 @@ try:
         sum_bits = tl.cast(sum_val, tl.uint32, bitcast=True)
 
         # random 16-bit int
-        rnd = tl.randint(seed, offs)
+        rnd = tl.randint((offsets + pid * 196314165).to(tl.uint32), offsets)
         rnd16 = rnd & 0xFFFF
 
         # add and clear low 16 bits
@@ -194,7 +152,7 @@ try:
 
         # store back as bfloat16
         out = tl.cast(rounded, tl.bfloat16)
-        tl.store(input_ptr + offs, out, mask=mask)
+        tl.store(input_ptr + offsets, out, mask=mask)
     HAS_TRITON = True
 except ImportError as e:
     print(e)
@@ -339,6 +297,7 @@ class CAME(Optimizer):
     def _rms(self, tensor):
         return tensor.norm(2) / (tensor.numel() ** 0.5)
 
+    # TODO: Implement in triton?
     def _approx_sq_grad(self, exp_avg_sq_row, exp_avg_sq_col):
         r_factor = (
             (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True))
@@ -397,53 +356,19 @@ class CAME(Optimizer):
         result.add_(input, alpha=alpha)
         self._copy_stochastic_python(input, result)
 
-    def _copy_stochastic_triton(self, target, source):
-        n = source.numel()
-        if n == 0:
-            return
-
-        t_copy_stochastic_seed = torch.randint(
-            low=0,
-            high=2 ** 31,
-            size=(1,),
-            device=source.device,
-            generator=self.stochastic_generators[source.device]
-        )
-
-        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
-        _copy_stochastic_kernel[grid](
-            target.flatten(),
-            source.flatten(),
-            int(t_copy_stochastic_seed.item()),
-            n,
-            BLOCK_SIZE=1024,
-        )
-
     def _add_stochastic_triton(self, input, other, alpha=1.0):
         n = input.numel()
         if n == 0:
             return
 
-        t_add_stochastic_seed = torch.randint(
-            low=0,
-            high=2 ** 31,
-            size=(1,),
-            device=input.device,
-            generator=self.stochastic_generators[input.device]
-        )
-
-        # ensure other is float32 contiguous
-        if other.dtype != torch.float32:
-            other_f = other.to(dtype=torch.float32)
-        else:
-            other_f = other
+        assert other.dtype == torch.float32
+        assert other.is_contiguous()
 
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
         _add_stochastic_kernel[grid](
             input.flatten(),
-            other_f.flatten(),
+            other.flatten(),
             float(alpha),
-            int(t_add_stochastic_seed.item()),
             n,
             BLOCK_SIZE=1024,
         )
@@ -744,7 +669,7 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if group["stochastic_backend"] == "triton" and p.numel() >= 16_777_216:
+                if group["stochastic_backend"] == "triton":
                     self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_python(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
@@ -753,7 +678,7 @@ class CAME(Optimizer):
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if group["stochastic_backend"] == "triton" and p.numel() >= 16_777_216:
+            if group["stochastic_backend"] == "triton":
                 self._add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_python(p.data, -update)
