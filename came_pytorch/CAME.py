@@ -9,7 +9,7 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def _get_block_stats_kernel(
+    def get_block_stats_kernel(
         input_ptr,
         min_ptr,
         max_ptr,
@@ -33,7 +33,7 @@ try:
         tl.store(max_ptr + pid, block_max)
 
     @triton.jit
-    def _quantize_kernel(
+    def quantize_kernel(
         output_ptr,
         input_ptr,
         scale_ptr,
@@ -85,7 +85,7 @@ try:
         tl.store(output_ptr + offsets, quantized_vals, mask=mask)
 
     @triton.jit
-    def _dequantize_kernel(
+    def dequantize_kernel(
         output_ptr,
         data_ptr,
         scale_ptr,
@@ -112,7 +112,7 @@ try:
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
 
     @triton.jit
-    def _add_stochastic_kernel(
+    def add_stochastic_kernel(
         input_ptr,            # pointer to bfloat16 in-place tensor (will be updated)
         other_ptr,            # pointer to float32 'other'
         alpha,                # float32 scalar multiplier
@@ -361,13 +361,18 @@ class CAME(Optimizer):
         if n == 0:
             return
 
-        assert other.dtype == torch.float32
-        assert other.is_contiguous()
+        result = (
+            other.clone()
+            if other.dtype == torch.float32
+            else other.to(dtype=torch.float32)
+        )
+        del other
+        assert result.is_contiguous()
 
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
-        _add_stochastic_kernel[grid](
+        add_stochastic_kernel[grid](
             input.flatten(),
-            other.flatten(),
+            result.flatten(),
             float(alpha),
             n,
             BLOCK_SIZE=1024,
@@ -428,7 +433,7 @@ class CAME(Optimizer):
         maxs = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
 
         grid = lambda meta: (num_quant_blocks,)
-        _get_block_stats_kernel[grid](
+        get_block_stats_kernel[grid](
             state_tensor.flatten(),
             mins,
             maxs,
@@ -440,7 +445,7 @@ class CAME(Optimizer):
         output_data = torch.empty_like(state_tensor, dtype=torch.uint8).flatten()
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        _quantize_kernel[grid](
+        quantize_kernel[grid](
             output_data,
             state_tensor.flatten(),
             scales,
@@ -460,7 +465,7 @@ class CAME(Optimizer):
         output = torch.empty(original_shape, dtype=torch.float32, device=state_data.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        _dequantize_kernel[grid](
+        dequantize_kernel[grid](
             output.flatten(),
             state_data.flatten(),
             scales,
