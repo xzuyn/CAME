@@ -139,7 +139,7 @@ except ImportError as e:
     HAS_TRITON = False
 
 try:
-    from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
+    from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise, quantize_nf4, dequantize_nf4
     HAS_BNB = True
 except ImportError as e:
     print(e)
@@ -148,6 +148,7 @@ except ImportError as e:
 # TODO: Add triton bnb
 # TODO: Try quantize_4bit
 # TODO: Try NF4, AF4, & BOF4
+# TODO: Reduce the nesting if statements when choosing to quant/dequant
 
 
 class CAME(Optimizer):
@@ -174,9 +175,9 @@ class CAME(Optimizer):
         enable_cautious (bool, optional): mask out update components whose sign
             conflicts with the gradient, boosting only aligned directions (default: False)
         enable_8bit (bool, optional): enable 8-bit quantization for large layers (default: False)
+        enable_4bit (bool, optional): enable 4-bit quantization for large layers (default: False)
         block_size (int, optional): quantization block size for 8-bit (default: 2048)
-        min_8bit_size (int, optional): minimum number of parameters to use 8-bit (default: 16384)
-        quiet_8bit (bool, optional): don't print layer info (default: True)
+        min_quant_size (int, optional): minimum number of parameters to use quantization (default: 16384)
         enable_gc (bool, optional): enable garbage collection before each step (default: False)
     """
 
@@ -192,10 +193,10 @@ class CAME(Optimizer):
         stochastic_backend="pytorch",
         enable_cautious=False,
         enable_8bit=False,
+        enable_4bit=False,
         quant_backend="pytorch",
         block_size=256,
-        min_8bit_size=16384,
-        quiet_8bit=True,
+        min_quant_size=16384,
         enable_gc=False,
     ):
         self.torch_gc()
@@ -208,6 +209,8 @@ class CAME(Optimizer):
             assert HAS_TRITON is True
         if quant_backend == "bnb":
             assert HAS_BNB is True
+        assert not (enable_8bit and enable_4bit)
+        assert not (enable_4bit and (quant_backend != "bnb"))
 
         defaults = dict(
             lr=lr,
@@ -219,10 +222,10 @@ class CAME(Optimizer):
             stochastic_backend=stochastic_backend,
             enable_cautious=enable_cautious,
             enable_8bit=enable_8bit,
+            enable_4bit=enable_4bit,
             quant_backend=quant_backend,
             block_size=block_size,
-            min_8bit_size=min_8bit_size,
-            quiet_8bit=quiet_8bit,
+            min_quant_size=min_quant_size,
             enable_gc=enable_gc,
         )
         super(CAME, self).__init__(params, defaults)
@@ -232,6 +235,7 @@ class CAME(Optimizer):
             enable_stochastic_rounding
             or enable_cautious
             or enable_8bit
+            or enable_4bit
             or enable_gc
         ):
             if enable_stochastic_rounding:
@@ -244,7 +248,9 @@ class CAME(Optimizer):
             if enable_cautious:
                 print("- Cautious Masking enabled.")
             if enable_8bit:
-                print(f"- 8-bit enabled: block_size={block_size}, min_8bit_size={min_8bit_size}, backend={quant_backend}.")
+                print(f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}, backend={quant_backend}.")
+            if enable_4bit:
+                print(f"- 4-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}, backend={quant_backend}.")
             if enable_gc:
                 print("- Garbage Collection enabled.")
         else:
@@ -260,18 +266,18 @@ class CAME(Optimizer):
         return False
 
     # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L523C1-L535C55
-    def _should_use_8bit(self, param_shape):
-        """Determine if a parameter should be quantized to 8bit
+    def _should_use_quantization(self, param_shape):
+        """Determine if a parameter should be quantized
 
         Rules:
-        1. linear layers: parameter size > min_8bit_size
-        2. 1x1 conv layers: parameter size > min_8bit_size
+        1. linear layers: parameter size > min_quant_size
+        2. 1x1 conv layers: parameter size > min_quant_size
         3. other layers: use 32bit
         """
         if len(param_shape) == 2:  # linear layer
-            return param_shape[0] * param_shape[1] > self.defaults["min_8bit_size"]
+            return param_shape[0] * param_shape[1] > self.defaults["min_quant_size"]
         elif len(param_shape) == 4 and param_shape[2] == 1 and param_shape[3] == 1:
-            return param_shape[0] * param_shape[1] > self.defaults["min_8bit_size"]
+            return param_shape[0] * param_shape[1] > self.defaults["min_quant_size"]
         return False  # other layers are not quantized
 
     def _rms(self, tensor):
@@ -456,22 +462,6 @@ class CAME(Optimizer):
 
         return output
 
-    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L501C1-L521C97
-    def print_layer_info(self, param_shape, use_8bit):
-        size = np.prod(param_shape)
-        layer_type = "unknown"
-        if len(param_shape) == 1:
-            layer_type = "1D Layer"
-        elif len(param_shape) == 2:
-            layer_type = "Linear"
-        elif len(param_shape) == 4:
-            if param_shape[2] == 1 and param_shape[3] == 1:
-                layer_type = "1x1 Conv"
-            else:
-                layer_type = "Conv"
-        status = "8bit" if use_8bit else "32bit"
-        print(f"{layer_type} layer with shape {param_shape}: {size:,} params -> using {status}")
-
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
     @staticmethod
     def torch_gc():
@@ -503,25 +493,25 @@ class CAME(Optimizer):
         grad_shape = grad.shape
 
         factored = len(grad_shape) >= 2
-        use_8bit = group["enable_8bit"] and self._should_use_8bit(grad_shape)
+        use_quantization = (group["enable_8bit"] or group["enable_4bit"]) and self._should_use_quantization(grad_shape)
 
         # State Initialization
         if len(state) == 0:
             state["step"] = 0
-            # initialize first moment with optional 8-bit quantization
-            if not group["quiet_8bit"]:
-                self.print_layer_info(grad_shape, use_8bit)
-            if use_8bit:
-                if group["quant_backend"] == "bnb":
+            # initialize first moment with optional quantization
+            if use_quantization:
+                if group["enable_8bit"] and group["quant_backend"] == "bnb":
                     state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                elif group["quant_backend"] == "triton":
+                elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     (
                         state["exp_avg"],
                         state["exp_avg_scales"],
                         state["exp_avg_mins"],
                     ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-                else:
+                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                     state["exp_avg"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_nf4(torch.zeros_like(grad), blocksize=group["block_size"])
             else:
                 state["exp_avg"] = torch.zeros_like(grad)
 
@@ -531,17 +521,19 @@ class CAME(Optimizer):
                 state["exp_avg_res_row"] = torch.zeros(grad_shape[:-1]).type_as(grad)
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
-                if use_8bit:
-                    if group["quant_backend"] == "bnb":
+                if use_quantization:
+                    if group["enable_8bit"] and group["quant_backend"] == "bnb":
                         state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
-                    elif group["quant_backend"] == "triton":
+                    elif group["enable_8bit"] and group["quant_backend"] == "triton":
                         (
                             state["exp_avg_sq"],
                             state["exp_avg_sq_scales"],
                             state["exp_avg_sq_mins"],
                         ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-                    else:
+                    elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                         state["exp_avg_sq"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                    elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_nf4(torch.zeros_like(grad), blocksize=group["block_size"])
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
             state["RMS"] = 0
@@ -550,10 +542,10 @@ class CAME(Optimizer):
         state["RMS"] = self._rms(p.data)
 
         # load / dequantize first moment
-        if use_8bit:
-            if group["quant_backend"] == "bnb":
+        if use_quantization:
+            if group["enable_8bit"] and group["quant_backend"] == "bnb":
                 exp_avg = dequantize_blockwise(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-            elif group["quant_backend"] == "triton":
+            elif group["enable_8bit"] and group["quant_backend"] == "triton":
                 exp_avg = self._dequantize_state_triton(
                     state["exp_avg"],
                     state["exp_avg_scales"],
@@ -561,8 +553,10 @@ class CAME(Optimizer):
                     grad_shape,
                     group["block_size"],
                 )
-            else:
+            elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                 exp_avg = self._dequantize_state_pytorch(state["exp_avg"])
+            elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                exp_avg = dequantize_nf4(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
         else:
             exp_avg = state["exp_avg"]
 
@@ -579,10 +573,10 @@ class CAME(Optimizer):
             update.mul_(grad)
         else:
             # non-factored: update second moment, quantize if needed
-            if use_8bit:
-                if group["quant_backend"] == "bnb":
+            if use_quantization:
+                if group["enable_8bit"] and group["quant_backend"] == "bnb":
                     exp_avg_sq = dequantize_blockwise(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
-                elif group["quant_backend"] == "triton":
+                elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     exp_avg_sq = self._dequantize_state_triton(
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
@@ -590,22 +584,26 @@ class CAME(Optimizer):
                         grad_shape,
                         group["block_size"],
                     )
-                else:
+                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                     exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"])
+                elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                    exp_avg_sq = dequantize_nf4(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
             else:
                 exp_avg_sq = state["exp_avg_sq"]
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
-            if use_8bit:
-                if group["quant_backend"] == "bnb":
+            if use_quantization:
+                if group["enable_8bit"] and group["quant_backend"] == "bnb":
                     state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_blockwise(exp_avg_sq, blocksize=group["block_size"])
-                elif group["quant_backend"] == "triton":
+                elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     (
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
                         state["exp_avg_sq_mins"],
                     ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
-                else:
+                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                     state["exp_avg_sq"] = self._quantize_state_pytorch(exp_avg_sq, group["block_size"])
+                elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_nf4(exp_avg_sq, blocksize=group["block_size"])
             else:
                 state["exp_avg_sq"] = exp_avg_sq
             update = exp_avg_sq.rsqrt().mul_(grad)
@@ -614,18 +612,20 @@ class CAME(Optimizer):
 
         # update first moment
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
-        # re-quantize first moment if using 8bit
-        if use_8bit:
-            if group["quant_backend"] == "bnb":
+        # re-quantize first moment if using quantization
+        if use_quantization:
+            if group["enable_8bit"] and group["quant_backend"] == "bnb":
                 state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
-            elif group["quant_backend"] == "triton":
+            elif group["enable_8bit"] and group["quant_backend"] == "triton":
                 (
                     state["exp_avg"],
                     state["exp_avg_scales"],
                     state["exp_avg_mins"],
                 ) = self._quantize_state_triton(exp_avg, group["block_size"])
-            else:
+            elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
                 state["exp_avg"] = self._quantize_state_pytorch(exp_avg, group["block_size"])
+            elif group["enable_4bit"] and group["quant_backend"] == "bnb":
+                state["exp_avg"], state["exp_avg_quant_state"] = quantize_nf4(exp_avg, blocksize=group["block_size"])
         else:
             state["exp_avg"] = exp_avg
 
