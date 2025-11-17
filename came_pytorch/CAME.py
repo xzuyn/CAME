@@ -55,31 +55,11 @@ try:
 
         input_vals = tl.load(input_ptr + offsets, mask=mask)
 
-        quantized_vals = ((input_vals - min_val) / scale) * 255.0
-
-        # Compute floor and fractional part
-        q_floor = tl.floor(quantized_vals)
-        frac = quantized_vals - q_floor
-
-        # Simple per-element LCG RNG (uint32)
-        # seed derived from offsets and program id so different threads get different streams
-        seed = (offsets + pid * 196314165).to(tl.uint32)
-
-        # LCG constants (use Python ints, cast result to uint32)
-        a = 1664525
-        c = 1013904223
-        state = (seed * a + c).to(tl.uint32)
-
-        # convert to float in [0,1)
-        rnd = state.to(tl.float32) / 4294967296.0
-
-        # increment with probability = fractional part
-        inc = tl.where(rnd < frac, 1.0, 0.0)
-
-        quantized_vals = q_floor + inc
-
-        quantized_vals = tl.where(quantized_vals > 255.0, 255.0, quantized_vals)
-        quantized_vals = tl.where(quantized_vals < 0.0, 0.0, quantized_vals)
+        # PyTorch uses round-half-to-even. This uses round-half-up
+        # I don't know how much this rounding matters
+        # Ideally I would put stochastic rounding here, but would complicate things
+        quantized_vals = tl.floor((((input_vals - min_val) / scale) * 255.0) + 0.5)
+        quantized_vals = tl.maximum(0.0, tl.minimum(255.0, quantized_vals))
         quantized_vals = quantized_vals.to(tl.uint8)
 
         tl.store(output_ptr + offsets, quantized_vals, mask=mask)
