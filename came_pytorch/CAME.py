@@ -9,60 +9,37 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def get_block_stats_kernel(
-        input_ptr,
-        min_ptr,
-        max_ptr,
-        num_quant_blocks,
-        QUANT_BLOCK_SIZE: tl.constexpr,
-    ):
-        """Triton kernel to find the min and max for each block in parallel."""
-        pid = tl.program_id(axis=0)
-        if pid >= num_quant_blocks:
-            return
-
-        block_start = pid * QUANT_BLOCK_SIZE
-        offsets = block_start + tl.arange(0, QUANT_BLOCK_SIZE)
-
-        block_vals = tl.load(input_ptr + offsets, eviction_policy="evict_first")
-
-        block_min = tl.min(block_vals, axis=0)
-        block_max = tl.max(block_vals, axis=0)
-
-        tl.store(min_ptr + pid, block_min)
-        tl.store(max_ptr + pid, block_max)
-
-    @triton.jit
     def quantize_kernel(
         output_ptr,
         input_ptr,
         scale_ptr,
         min_ptr,
         n_elements,
+        NUM_QUANT_BLOCKS: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
-        QUANT_BLOCK_SIZE: tl.constexpr,
     ):
-        """Triton kernel to quantize a tensor using pre-computed stats."""
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        quant_block_idx = offsets // QUANT_BLOCK_SIZE
+        vals = tl.load(input_ptr + offsets, mask=mask)
 
-        scale = tl.load(scale_ptr + quant_block_idx, mask=mask)
-        min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
-
-        input_vals = tl.load(input_ptr + offsets, mask=mask)
+        chunk_min = tl.min(tl.where(mask, vals, float("inf")), axis=0)
+        scale = (tl.max(tl.where(mask, vals, float("-inf")), axis=0) - chunk_min) / 255.0
 
         # PyTorch uses round-half-to-even. This uses round-half-up
         # I don't know how much this rounding matters
         # Ideally I would put stochastic rounding here, but would complicate things
-        quantized_vals = tl.floor((((input_vals - min_val) / scale) * 255.0) + 0.5)
-        quantized_vals = tl.maximum(0.0, tl.minimum(255.0, quantized_vals))
-        quantized_vals = quantized_vals.to(tl.uint8)
+        q = tl.floor(((vals - chunk_min) / scale) + 0.5).to(tl.uint8)
 
-        tl.store(output_ptr + offsets, quantized_vals, mask=mask)
+        # store quantized bytes (partial store supported by mask)
+        tl.store(output_ptr + offsets, q, mask=mask)
+
+        # store per-block scale & min (only if block exists)
+        if pid < NUM_QUANT_BLOCKS:
+            tl.store(scale_ptr + pid, scale)
+            tl.store(min_ptr + pid, chunk_min)
 
     @triton.jit
     def dequantize_kernel(
@@ -71,10 +48,9 @@ try:
         scale_ptr,
         min_ptr,
         n_elements,
-        BLOCK_SIZE: tl.constexpr,
         QUANT_BLOCK_SIZE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
     ):
-        """Triton kernel to dequantize a tensor."""
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
@@ -84,10 +60,9 @@ try:
 
         scale = tl.load(scale_ptr + quant_block_idx, mask=mask)
         min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
-
         quantized_data = tl.load(data_ptr + offsets, mask=mask)
 
-        dequantized_data = (quantized_data.to(tl.float32) / 255.0) * scale + min_val
+        dequantized_data = quantized_data.to(tl.float32) * scale + min_val
 
         tl.store(output_ptr + offsets, dequantized_data, mask=mask)
 
@@ -412,32 +387,21 @@ class CAME(Optimizer):
 
     def _quantize_state_triton(self, state_tensor, block_size):
         n_elements = state_tensor.numel()
-        num_quant_blocks = (n_elements + block_size - 1) // block_size
+        num_blocks = (n_elements + block_size - 1) // block_size
 
-        mins = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
-        maxs = torch.empty((num_quant_blocks,), dtype=torch.float32, device=state_tensor.device)
-
-        grid = lambda meta: (num_quant_blocks,)
-        get_block_stats_kernel[grid](
-            state_tensor.flatten(),
-            mins,
-            maxs,
-            num_quant_blocks,
-            QUANT_BLOCK_SIZE=block_size,
-        )
-
-        scales = maxs - mins
-        output_data = torch.empty_like(state_tensor, dtype=torch.uint8).flatten()
+        mins = torch.empty((num_blocks,), dtype=torch.float32, device=state_tensor.device)
+        scales = torch.empty((num_blocks,), dtype=torch.float32, device=state_tensor.device)
+        output_data = torch.empty_like(state_tensor, dtype=torch.uint8)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         quantize_kernel[grid](
-            output_data,
+            output_data.flatten(),
             state_tensor.flatten(),
             scales,
             mins,
             n_elements,
-            BLOCK_SIZE=1024,
-            QUANT_BLOCK_SIZE=block_size,
+            NUM_QUANT_BLOCKS=num_blocks,
+            BLOCK_SIZE=block_size,  # Can't tune, needs to match quant block size
         )
 
         return output_data.reshape(state_tensor.shape), scales, mins
@@ -456,10 +420,9 @@ class CAME(Optimizer):
             scales,
             mins,
             n_elements,
-            BLOCK_SIZE=1024,
             QUANT_BLOCK_SIZE=block_size,
+            BLOCK_SIZE=1024,  # TODO: Tune
         )
-
         return output
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
