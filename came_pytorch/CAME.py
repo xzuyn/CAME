@@ -1,5 +1,4 @@
 import gc
-import numpy as np
 import torch
 from torch.optim import Optimizer
 
@@ -463,18 +462,22 @@ class CAME(Optimizer):
             state["step"] = 0
             # initialize first moment with optional quantization
             if use_quantization:
-                if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
+                if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                    state["exp_avg"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     (
                         state["exp_avg"],
                         state["exp_avg_scales"],
                         state["exp_avg_mins"],
                     ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    state["exp_avg"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(
+                        torch.zeros_like(grad), blocksize=group["block_size"]
+                    )
                 elif group["enable_4bit"] and group["quant_backend"] == "bnb":
-                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_nf4(torch.zeros_like(grad), blocksize=group["block_size"])
+                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_nf4(
+                        torch.zeros_like(grad), blocksize=group["block_size"]
+                    )
             else:
                 state["exp_avg"] = torch.zeros_like(grad)
 
@@ -485,18 +488,22 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_quantization:
-                    if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_blockwise(torch.zeros_like(grad), blocksize=group["block_size"])
+                    if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                        state["exp_avg_sq"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
                     elif group["enable_8bit"] and group["quant_backend"] == "triton":
                         (
                             state["exp_avg_sq"],
                             state["exp_avg_sq_scales"],
                             state["exp_avg_sq_mins"],
                         ) = self._quantize_state_triton(torch.zeros_like(grad), group["block_size"])
-                    elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                        state["exp_avg_sq"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                    elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_blockwise(
+                            torch.zeros_like(grad), blocksize=group["block_size"]
+                        )
                     elif group["enable_4bit"] and group["quant_backend"] == "bnb":
-                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_nf4(torch.zeros_like(grad), blocksize=group["block_size"])
+                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_nf4(
+                            torch.zeros_like(grad), blocksize=group["block_size"]
+                        )
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
             state["RMS"] = 0
@@ -506,8 +513,8 @@ class CAME(Optimizer):
 
         # load / dequantize first moment
         if use_quantization:
-            if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                exp_avg = dequantize_blockwise(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
+            if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                exp_avg = self._dequantize_state_pytorch(state["exp_avg"])
             elif group["enable_8bit"] and group["quant_backend"] == "triton":
                 exp_avg = self._dequantize_state_triton(
                     state["exp_avg"],
@@ -516,10 +523,14 @@ class CAME(Optimizer):
                     grad_shape,
                     group["block_size"],
                 )
-            elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                exp_avg = self._dequantize_state_pytorch(state["exp_avg"])
+            elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                exp_avg = dequantize_blockwise(
+                    state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"]
+                )
             elif group["enable_4bit"] and group["quant_backend"] == "bnb":
-                exp_avg = dequantize_nf4(state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
+                exp_avg = dequantize_nf4(
+                    state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"]
+                )
         else:
             exp_avg = state["exp_avg"]
 
@@ -537,8 +548,8 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment, quantize if needed
             if use_quantization:
-                if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                    exp_avg_sq = dequantize_blockwise(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
+                if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                    exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"])
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     exp_avg_sq = self._dequantize_state_triton(
                         state["exp_avg_sq"],
@@ -547,46 +558,58 @@ class CAME(Optimizer):
                         grad_shape,
                         group["block_size"],
                     )
-                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"])
+                elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                    exp_avg_sq = dequantize_blockwise(
+                        state["exp_avg_sq"], quant_state=state["exp_avg_sq_quant_state"], blocksize=group["block_size"]
+                    )
                 elif group["enable_4bit"] and group["quant_backend"] == "bnb":
-                    exp_avg_sq = dequantize_nf4(state["exp_avg_sq"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"])
+                    exp_avg_sq = dequantize_nf4(
+                        state["exp_avg_sq"], quant_state=state["exp_avg_sq_quant_state"], blocksize=group["block_size"]
+                    )
             else:
                 exp_avg_sq = state["exp_avg_sq"]
+
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
+
             if use_quantization:
-                if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_blockwise(exp_avg_sq, blocksize=group["block_size"])
+                if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                    state["exp_avg_sq"] = self._quantize_state_pytorch(exp_avg_sq, group["block_size"])
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
                     (
                         state["exp_avg_sq"],
                         state["exp_avg_sq_scales"],
                         state["exp_avg_sq_mins"],
                     ) = self._quantize_state_triton(exp_avg_sq, group["block_size"])
-                elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    state["exp_avg_sq"] = self._quantize_state_pytorch(exp_avg_sq, group["block_size"])
+                elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_blockwise(
+                        exp_avg_sq, blocksize=group["block_size"]
+                    )
                 elif group["enable_4bit"] and group["quant_backend"] == "bnb":
-                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_nf4(exp_avg_sq, blocksize=group["block_size"])
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_nf4(
+                        exp_avg_sq, blocksize=group["block_size"]
+                    )
             else:
                 state["exp_avg_sq"] = exp_avg_sq
+
             update = exp_avg_sq.rsqrt().mul_(grad)
 
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
 
         # update first moment
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
+
         # re-quantize first moment if using quantization
         if use_quantization:
-            if group["enable_8bit"] and group["quant_backend"] == "bnb":
-                state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
+            if group["enable_8bit"] and group["quant_backend"] == "pytorch":
+                state["exp_avg"] = self._quantize_state_pytorch(exp_avg, group["block_size"])
             elif group["enable_8bit"] and group["quant_backend"] == "triton":
                 (
                     state["exp_avg"],
                     state["exp_avg_scales"],
                     state["exp_avg_mins"],
                 ) = self._quantize_state_triton(exp_avg, group["block_size"])
-            elif group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                state["exp_avg"] = self._quantize_state_pytorch(exp_avg, group["block_size"])
+            elif group["enable_8bit"] and group["quant_backend"] == "bnb":
+                state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
             elif group["enable_4bit"] and group["quant_backend"] == "bnb":
                 state["exp_avg"], state["exp_avg_quant_state"] = quantize_nf4(exp_avg, blocksize=group["block_size"])
         else:
