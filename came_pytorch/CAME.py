@@ -27,13 +27,20 @@ try:
         chunk_min = tl.min(tl.where(mask, vals, float("inf")), axis=0)
         scale = (tl.max(tl.where(mask, vals, float("-inf")), axis=0) - chunk_min) / 255.0
 
-        # PyTorch uses round-half-to-even. This uses round-half-up
-        # I don't know how much this rounding matters
-        # Ideally I would put stochastic rounding here, but would complicate things
-        q = tl.floor(((vals - chunk_min) / scale) + 0.5).to(tl.uint8)
+        is_scale_zero = scale == 0.0
+        safe_scale = tl.where(is_scale_zero, 1.0, scale)
+        vals_scaled = (vals - chunk_min) / safe_scale
+
+        rounded_half_up = tl.floor(vals_scaled + 0.5)
+        floor_val = tl.floor(vals_scaled)
+        is_tie = (vals_scaled - floor_val) == 0.5
+        is_floor_even = (floor_val.to(tl.int32) % 2) == 0
+
+        rounded_data = tl.where(is_tie & is_floor_even, floor_val, rounded_half_up)
+        quantized_data = tl.where(is_scale_zero, 0, rounded_data).to(tl.uint8)
 
         # store quantized bytes (partial store supported by mask)
-        tl.store(output_ptr + offsets, q, mask=mask)
+        tl.store(output_ptr + offsets, quantized_data, mask=mask)
 
         # store per-block scale & min (only if block exists)
         if pid < NUM_QUANT_BLOCKS:
@@ -362,7 +369,10 @@ class CAME(Optimizer):
             scale = (chunk_max - chunk_min) / 255
 
             # Quantize to 0-255 range
-            quantized_chunks.append({"data": ((chunk - chunk_min) / scale).round().byte(), "scale": scale, "min": chunk_min})
+            if scale != 0:
+                quantized_chunks.append({"data": ((chunk - chunk_min) / scale).round().byte(), "scale": scale, "min": chunk_min})
+            else:
+                quantized_chunks.append({"data": torch.zeros_like(chunk, dtype=torch.uint8), "scale": scale, "min": chunk_min})
         return quantized_chunks
 
     # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
