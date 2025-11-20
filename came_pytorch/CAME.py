@@ -8,7 +8,7 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def quantize_kernel(
+    def quantize_kernel_rhe(
         output_ptr,
         input_ptr,
         scale_ptr,
@@ -28,16 +28,15 @@ try:
         scale = (tl.max(tl.where(mask, vals, float("-inf")), axis=0) - chunk_min) / 255.0
 
         is_scale_zero = scale == 0.0
-        safe_scale = tl.where(is_scale_zero, 1.0, scale)
-        vals_scaled = (vals - chunk_min) / safe_scale
-
-        rounded_half_up = tl.floor(vals_scaled + 0.5)
+        vals_scaled = (vals - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
         floor_val = tl.floor(vals_scaled)
-        is_tie = (vals_scaled - floor_val) == 0.5
-        is_floor_even = (floor_val.to(tl.int32) % 2) == 0
 
-        rounded_data = tl.where(is_tie & is_floor_even, floor_val, rounded_half_up)
-        quantized_data = tl.where(is_scale_zero, 0, rounded_data).to(tl.uint8)
+        quantized_data = tl.where(
+            ((vals_scaled - floor_val) == 0.5) & ((floor_val.to(tl.int32) % 2) == 0),
+            floor_val,
+            tl.floor(vals_scaled + 0.5),
+        )
+        quantized_data = tl.where(is_scale_zero, 0, quantized_data).to(tl.uint8)
 
         # store quantized bytes (partial store supported by mask)
         tl.store(output_ptr + offsets, quantized_data, mask=mask)
@@ -74,46 +73,102 @@ try:
 
     @triton.jit
     def add_stochastic_kernel(
-        input_ptr,            # pointer to bfloat16 in-place tensor (will be updated)
-        other_ptr,            # pointer to float32 'other'
-        alpha,                # float32 scalar multiplier
+        a_ptr,
+        b_ptr,
+        alpha,
+        seed,
         n_elements,
         BLOCK_SIZE: tl.constexpr,
     ):
-        """
-        Kernel that computes `other + alpha * input` (where input is bfloat16), then stochastically rounds
-        the result back into bfloat16 and stores it into input_ptr in-place.
-        """
         pid = tl.program_id(axis=0)
         block_start = pid * BLOCK_SIZE
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        # load input (bfloat16) and other (float32)
-        inp = tl.load(input_ptr + offsets, mask=mask)
-        other = tl.load(other_ptr + offsets, mask=mask)
+        A = tl.load(a_ptr + offsets, mask=mask)
+        B = tl.load(b_ptr + offsets, mask=mask)
 
-        # cast input to float32 to compute sum
-        inp_f = tl.cast(inp, tl.float32)
-        sum_val = other + inp_f * alpha
+        A = tl.cast(A, tl.float32)
+        A = B + (A * alpha)
+        A = tl.cast(A, tl.uint32, bitcast=True)
+        A = A + (tl.randint((seed + offsets + pid).to(tl.uint32), offsets) & 0xFFFF)
+        A = A & 0xFFFF0000
+        A = tl.cast(A, tl.float32, bitcast=True)
+        A = tl.cast(A, tl.bfloat16)
 
-        # bitcast sum_val to uint32
-        sum_bits = tl.cast(sum_val, tl.uint32, bitcast=True)
+        tl.store(a_ptr + offsets, A, mask=mask)
 
-        # random 16-bit int
-        rnd = tl.randint((offsets + pid * 196314165).to(tl.uint32), offsets)
-        rnd16 = rnd & 0xFFFF
+    def quantize_state_triton_rhe(A, block_size):
+        n_elements = A.numel()
+        if n_elements <= 1:
+            return A
 
-        # add and clear low 16 bits
-        added = sum_bits + rnd16
-        rounded_bits = added & 0xFFFF0000
+        num_blocks = (n_elements + block_size - 1) // block_size
+        mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
+        scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
+        output_data = torch.empty_like(A, dtype=torch.uint8)
 
-        # bitcast back to float32
-        rounded = tl.cast(rounded_bits, tl.float32, bitcast=True)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        quantize_kernel_rhe[grid](
+            output_data.flatten(),
+            A.flatten(),
+            scales,
+            mins,
+            n_elements,
+            NUM_QUANT_BLOCKS=num_blocks,
+            BLOCK_SIZE=block_size,
+        )
 
-        # store back as bfloat16
-        out = tl.cast(rounded, tl.bfloat16)
-        tl.store(input_ptr + offsets, out, mask=mask)
+        return output_data.reshape(A.shape), {
+            "scales": scales,
+            "mins": mins,
+            "shape": A.shape,
+            "block_size": block_size,
+        }
+
+    def dequantize_state_triton(A, quant_state):
+        n_elements = A.numel()
+
+        output = torch.empty(quant_state["shape"], dtype=torch.float32, device=A.device)
+
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+        dequantize_kernel[grid](
+            output.flatten(),
+            A.flatten(),
+            quant_state["scales"],
+            quant_state["mins"],
+            n_elements,
+            QUANT_BLOCK_SIZE=quant_state["block_size"],
+            BLOCK_SIZE=1024,  # TODO: Tune
+        )
+
+        return output
+
+    def add_stochastic_triton(A, B, alpha=1.0, seed=None):
+        n = A.numel()
+        if n == 0:
+            return
+
+        B = (
+            B.clone()
+            if B.dtype == torch.float32
+            else B.to(dtype=torch.float32)
+        )
+        assert B.is_contiguous()
+
+        if seed is None:
+            seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
+
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+        add_stochastic_kernel[grid](
+            A.flatten(),
+            B.flatten(),
+            float(alpha),
+            seed,
+            n,
+            BLOCK_SIZE=1024,
+        )
+
     HAS_TRITON = True
 except ImportError as e:
     print(e)
@@ -323,124 +378,57 @@ class CAME(Optimizer):
         result.add_(input, alpha=alpha)
         self._copy_stochastic_pytorch(input, result)
 
-    def _add_stochastic_triton(self, input, other, alpha=1.0):
-        n = input.numel()
-        if n == 0:
-            return
-
-        other = (
-            other.clone()
-            if other.dtype == torch.float32
-            else other.to(dtype=torch.float32)
-        )
-        assert other.is_contiguous()
-
-        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
-        add_stochastic_kernel[grid](
-            input.flatten(),
-            other.flatten(),
-            float(alpha),
-            n,
-            BLOCK_SIZE=1024,
-        )
-
-    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
-    def _quantize_state_pytorch(self, state_tensor, block_size):
-        """Quantize a state tensor to 8bit
-
-        Args:
-            state_tensor: tensor to be quantized
-            block_size: quantization block size
-
-        Returns:
-            list of quantized data blocks, each block contains:
-            - data: uint8 data
-            - scale: quantization scale
-            - min: minimum value
-        """
-        if state_tensor.numel() <= 1:
-            return state_tensor
-
-        quantized_chunks = []
-        for chunk in state_tensor.split(block_size):
-            # Calculate quantization parameters
-            chunk_min = chunk.min()
-            chunk_max = chunk.max()
-            scale = (chunk_max - chunk_min) / 255
-
-            # Quantize to 0-255 range
-            if scale != 0:
-                quantized_chunks.append({"data": ((chunk - chunk_min) / scale).round().byte(), "scale": scale, "min": chunk_min})
-            else:
-                quantized_chunks.append({"data": torch.zeros_like(chunk, dtype=torch.uint8), "scale": scale, "min": chunk_min})
-        return quantized_chunks
-
-    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
-    def _dequantize_state_pytorch(self, quantized_chunks):
-        """Dequantize 8bit quantized data to 32bit float
-
-        Args:
-            quantized_chunks: list of quantized data blocks
-
-        Returns:
-            dequantized 32bit float tensor
-        """
-        if not isinstance(quantized_chunks, list):
-            return quantized_chunks
-
-        chunks = []
-        for chunk_dict in quantized_chunks:
-            # Dequantize: value = data * scale + min
-            chunks.append(chunk_dict["data"].float() * chunk_dict["scale"] + chunk_dict["min"])
-        return torch.cat(chunks)
-
-    def _quantize_state_triton(self, A, block_size):
+    # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
+    def _quantize_state_pytorch(self, A, block_size):
         n_elements = A.numel()
         if n_elements <= 1:
-            return A
+            return A, {}
 
+        shape = A.shape
         num_blocks = (n_elements + block_size - 1) // block_size
-        mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
-        scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
-        output_data = torch.empty_like(A, dtype=torch.uint8)
 
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        quantize_kernel[grid](
-            output_data.flatten(),
-            A.flatten(),
-            scales,
-            mins,
-            n_elements,
-            NUM_QUANT_BLOCKS=num_blocks,
-            BLOCK_SIZE=block_size,  # Can't tune, needs to match quant block size
-        )
-        return output_data.reshape(A.shape), {
+        A = A.flatten()
+        A = A.unsqueeze(0)
+        A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "replicate")
+        A = A.squeeze(0)
+        A = A.view(num_blocks, block_size)
+
+        block_mins = A.min(dim=1).values
+        scales = (A.max(dim=1).values - block_mins) / 255.0
+        is_scale_zero = scales == 0
+
+        A = A - block_mins.unsqueeze(1)
+        A = A / torch.where(is_scale_zero, 1.0, scales).unsqueeze(1)
+        A = A.round()
+        A = torch.where(is_scale_zero.unsqueeze(1), 0, A)
+        A = A.to(torch.uint8)
+        A = A.flatten()
+        A = A[:n_elements]
+
+        return A.reshape(shape), {
             "scales": scales,
-            "mins": mins,
-            "shape": A.shape,
+            "mins": block_mins,
+            "shape": shape,
             "block_size": block_size,
         }
 
-    def _dequantize_state_triton(self, A, quant_state):
+    # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
+    def _dequantize_state_pytorch(self, A, quant_state):
         n_elements = A.numel()
+        block_size = quant_state["block_size"]
 
-        output = torch.empty(
-            quant_state["shape"],
-            dtype=torch.float32,
-            device=A.device,
-        )
+        num_blocks = (n_elements + block_size - 1) // block_size
 
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        dequantize_kernel[grid](
-            output.flatten(),
-            A.flatten(),
-            quant_state["scales"],
-            quant_state["mins"],
-            n_elements,
-            QUANT_BLOCK_SIZE=quant_state["block_size"],
-            BLOCK_SIZE=1024,  # TODO: Tune
-        )
-        return output
+        A = A.flatten()
+        A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "constant", 0)
+        A = A.view(num_blocks, block_size)
+        A = A.float()
+        A = A * quant_state["scales"].unsqueeze(1)
+        A = A + quant_state["mins"].unsqueeze(1)
+        A = A.flatten()
+        A = A[:n_elements]
+
+        return A.reshape(quant_state["shape"])
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
     @staticmethod
@@ -481,9 +469,11 @@ class CAME(Optimizer):
             # initialize first moment with optional quantization
             if use_quantization:
                 if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    state["exp_avg"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                    state["exp_avg"], state["exp_avg_quant_state"] = self._quantize_state_pytorch(
+                        torch.zeros_like(grad), group["block_size"]
+                    )
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                    state["exp_avg"], state["exp_avg_quant_state"] = self._quantize_state_triton(
+                    state["exp_avg"], state["exp_avg_quant_state"] = quantize_state_triton_rhe(
                         torch.zeros_like(grad), group["block_size"]
                     )
                 elif group["enable_8bit"] and group["quant_backend"] == "bnb":
@@ -505,9 +495,11 @@ class CAME(Optimizer):
             else:
                 if use_quantization:
                     if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                        state["exp_avg_sq"] = self._quantize_state_pytorch(torch.zeros_like(grad), group["block_size"])
+                        state["exp_avg_sq"], state["exp_avg_quant_state"] = self._quantize_state_pytorch(
+                            torch.zeros_like(grad), group["block_size"]
+                        )
                     elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                        state["exp_avg_sq"], state["exp_avg_quant_state"] = self._quantize_state_triton(
+                        state["exp_avg_sq"], state["exp_avg_quant_state"] = quantize_state_triton_rhe(
                             torch.zeros_like(grad), group["block_size"]
                         )
                     elif group["enable_8bit"] and group["quant_backend"] == "bnb":
@@ -528,9 +520,9 @@ class CAME(Optimizer):
         # load / dequantize first moment
         if use_quantization:
             if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                exp_avg = self._dequantize_state_pytorch(state["exp_avg"])
+                exp_avg = self._dequantize_state_pytorch(state["exp_avg"], state["exp_avg_quant_state"])
             elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                exp_avg = self._dequantize_state_triton(state["exp_avg"], state["exp_avg_quant_state"])
+                exp_avg = dequantize_state_triton(state["exp_avg"], state["exp_avg_quant_state"])
             elif group["enable_8bit"] and group["quant_backend"] == "bnb":
                 exp_avg = dequantize_blockwise(
                     state["exp_avg"], quant_state=state["exp_avg_quant_state"], blocksize=group["block_size"]
@@ -557,9 +549,9 @@ class CAME(Optimizer):
             # non-factored: update second moment, quantize if needed
             if use_quantization:
                 if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"])
+                    exp_avg_sq = self._dequantize_state_pytorch(state["exp_avg_sq"], state["exp_avg_sq_quant_state"])
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                    exp_avg_sq = self._dequantize_state_triton(state["exp_avg_sq"], state["exp_avg_sq_quant_state"])
+                    exp_avg_sq = dequantize_state_triton(state["exp_avg_sq"], state["exp_avg_sq_quant_state"])
                 elif group["enable_8bit"] and group["quant_backend"] == "bnb":
                     exp_avg_sq = dequantize_blockwise(
                         state["exp_avg_sq"], quant_state=state["exp_avg_sq_quant_state"], blocksize=group["block_size"]
@@ -575,9 +567,11 @@ class CAME(Optimizer):
 
             if use_quantization:
                 if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                    state["exp_avg_sq"] = self._quantize_state_pytorch(exp_avg_sq, group["block_size"])
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self._quantize_state_pytorch(
+                        exp_avg_sq, group["block_size"]
+                    )
                 elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self._quantize_state_triton(
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = quantize_state_triton_rhe(
                         exp_avg_sq, group["block_size"]
                     )
                 elif group["enable_8bit"] and group["quant_backend"] == "bnb":
@@ -601,9 +595,11 @@ class CAME(Optimizer):
         # re-quantize first moment if using quantization
         if use_quantization:
             if group["enable_8bit"] and group["quant_backend"] == "pytorch":
-                state["exp_avg"] = self._quantize_state_pytorch(exp_avg, group["block_size"])
+                state["exp_avg"], state["exp_avg_quant_state"] = self._quantize_state_pytorch(
+                    exp_avg, group["block_size"]
+                )
             elif group["enable_8bit"] and group["quant_backend"] == "triton":
-                state["exp_avg"], state["exp_avg_quant_state"] = self._quantize_state_triton(exp_avg, group["block_size"])
+                state["exp_avg"], state["exp_avg_quant_state"] = quantize_state_triton_rhe(exp_avg, group["block_size"])
             elif group["enable_8bit"] and group["quant_backend"] == "bnb":
                 state["exp_avg"], state["exp_avg_quant_state"] = quantize_blockwise(exp_avg, blocksize=group["block_size"])
             elif group["enable_4bit"] and group["quant_backend"] == "bnb":
@@ -636,7 +632,7 @@ class CAME(Optimizer):
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
                 if group["stochastic_backend"] == "triton":
-                    self._add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+                    add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
                 else:
                     self._add_stochastic_pytorch(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
             else:
@@ -645,7 +641,7 @@ class CAME(Optimizer):
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
             if group["stochastic_backend"] == "triton":
-                self._add_stochastic_triton(p.data, -update)
+                add_stochastic_triton(p.data, -update)
             else:
                 self._add_stochastic_pytorch(p.data, -update)
         else:
