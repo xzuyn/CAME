@@ -10,6 +10,7 @@ try:
     @triton.jit
     def quantize_kernel_rhe(  # round-half-even
         a_ptr,
+        a_quant_ptr,
         scale_ptr,
         min_ptr,
         n_elements,
@@ -35,10 +36,10 @@ try:
             floor_val,
             tl.floor(A_scaled + 0.5),
         )
-        A = tl.where(is_scale_zero, 0, A).to(tl.uint8)
+        A = tl.where(is_scale_zero, 0, A)
 
         # store quantized bytes (partial store supported by mask)
-        tl.store(a_ptr + offsets, A, mask=mask)
+        tl.store(a_quant_ptr + offsets, A.to(tl.uint8), mask=mask)
 
         # store per-block scale & min (only if block exists)
         if pid < NUM_QUANT_BLOCKS:
@@ -48,6 +49,7 @@ try:
     @triton.jit
     def dequantize_kernel(
         a_ptr,
+        a_dequant_ptr,
         scale_ptr,
         min_ptr,
         n_elements,
@@ -65,37 +67,7 @@ try:
         scale = tl.load(scale_ptr + quant_block_idx, mask=mask)
         min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
 
-        A = A.to(tl.float32)
-        A = A * scale + min_val
-
-        tl.store(a_ptr + offsets, A, mask=mask)
-
-    @triton.jit
-    def add_stochastic_kernel(
-        a_ptr,
-        b_ptr,
-        alpha,
-        seed,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(axis=0)
-        block_start = pid * BLOCK_SIZE
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
-
-        A = tl.load(a_ptr + offsets, mask=mask)
-        B = tl.load(b_ptr + offsets, mask=mask)
-
-        A = tl.cast(A, tl.float32)
-        A = B + (A * alpha)
-        A = tl.cast(A, tl.uint32, bitcast=True)
-        A = A + (tl.randint((seed + offsets + pid).to(tl.uint32), offsets) & 0xFFFF)
-        A = A & 0xFFFF0000
-        A = tl.cast(A, tl.float32, bitcast=True)
-        A = tl.cast(A, tl.bfloat16)
-
-        tl.store(a_ptr + offsets, A, mask=mask)
+        tl.store(a_dequant_ptr + offsets, (A.to(tl.float32) * scale) + min_val, mask=mask)
 
     def quantize_state_triton_rhe(A, block_size):
         n_elements = A.numel()
@@ -106,10 +78,12 @@ try:
         num_blocks = (n_elements + block_size - 1) // block_size
         mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
         scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
+        A_quant = torch.empty_like(A, dtype=torch.uint8, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         quantize_kernel_rhe[grid](
-            A.flatten(),
+            A.reshape(-1),
+            A_quant.reshape(-1),
             scales,
             mins,
             n_elements,
@@ -117,7 +91,7 @@ try:
             BLOCK_SIZE=block_size,
         )
 
-        return A, {
+        return A_quant, {
             "scales": scales,
             "mins": mins,
             "block_size": block_size,
@@ -126,10 +100,15 @@ try:
 
     def dequantize_state_triton(A, quant_state):
         n_elements = A.numel()
+        if n_elements <= 1:
+            return A
+
+        A_dequant = torch.empty_like(A, dtype=torch.float32, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         dequantize_kernel[grid](
-            A.flatten(),
+            A.reshape(-1),
+            A_dequant.reshape(-1),
             quant_state["scales"],
             quant_state["mins"],
             n_elements,
@@ -137,28 +116,7 @@ try:
             BLOCK_SIZE=1024,  # TODO: Tune
         )
 
-        return A.reshape(quant_state["shape"])
-
-    def add_stochastic_triton(A, B, alpha=1.0, seed=None):
-        n_elements = A.numel()
-        if n_elements == 0:
-            return
-
-        B = B.clone() if B.dtype == torch.float32 else B.to(dtype=torch.float32)
-        assert B.is_contiguous()
-
-        if seed is None:
-            seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
-
-        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-        add_stochastic_kernel[grid](
-            A,
-            B,
-            float(alpha),
-            seed,
-            n_elements,
-            BLOCK_SIZE=1024,
-        )
+        return A_dequant.reshape(quant_state["shape"])
 
     HAS_TRITON = True
 except ImportError as e:
@@ -217,7 +175,6 @@ class CAME(Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         enable_stochastic_rounding=False,
-        stochastic_backend="pytorch",
         enable_cautious=False,
         enable_8bit=False,
         enable_4bit=False,
@@ -230,9 +187,8 @@ class CAME(Optimizer):
 
         assert lr > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
-        assert stochastic_backend in ["pytorch", "triton"]
         assert quant_backend in ["pytorch", "triton", "bnb"]
-        if stochastic_backend == "triton" or quant_backend == "triton":
+        if quant_backend == "triton":
             assert HAS_TRITON is True
         if quant_backend == "bnb":
             assert HAS_BNB is True
@@ -246,7 +202,6 @@ class CAME(Optimizer):
             betas=betas,
             weight_decay=weight_decay,
             enable_stochastic_rounding=enable_stochastic_rounding,
-            stochastic_backend=stochastic_backend,
             enable_cautious=enable_cautious,
             enable_8bit=enable_8bit,
             enable_4bit=enable_4bit,
@@ -266,7 +221,7 @@ class CAME(Optimizer):
             or enable_gc
         ):
             if enable_stochastic_rounding:
-                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}, backend={stochastic_backend}.")
+                print(f"- Stochastic Rounding enabled: seed={torch.initial_seed()}.")
                 self.stochastic_generators = {}
                 for stochastic_device in {p.device for group in self.param_groups for p in group["params"]}:
                     stochastic_generator = torch.Generator(device=stochastic_device)
@@ -405,8 +360,10 @@ class CAME(Optimizer):
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
     def _dequantize_state_pytorch(self, A, quant_state):
         n_elements = A.numel()
-        block_size = quant_state["block_size"]
+        if n_elements <= 1:
+            return A
 
+        block_size = quant_state["block_size"]
         num_blocks = (n_elements + block_size - 1) // block_size
 
         A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "constant", 0)
@@ -620,19 +577,13 @@ class CAME(Optimizer):
 
         if group["weight_decay"] != 0:
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                if group["stochastic_backend"] == "triton":
-                    add_stochastic_triton(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
-                else:
-                    self._add_stochastic_pytorch(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
+                self._add_stochastic_pytorch(p.data, p.data, alpha=-group["weight_decay"] * group["lr"])
             else:
                 p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-            if group["stochastic_backend"] == "triton":
-                add_stochastic_triton(p.data, -update)
-            else:
-                self._add_stochastic_pytorch(p.data, -update)
+            self._add_stochastic_pytorch(p.data, -update)
         else:
             p.data.add_(-update)
 
