@@ -106,12 +106,12 @@ try:
         num_blocks = (n_elements + block_size - 1) // block_size
         mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
         scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
-        output_data = torch.empty_like(A, dtype=torch.uint8)
+        output_data = torch.empty_like(A, dtype=torch.uint8, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         quantize_kernel_rhe[grid](
-            output_data.flatten(),
-            A.flatten(),
+            output_data,
+            A,
             scales,
             mins,
             n_elements,
@@ -119,22 +119,21 @@ try:
             BLOCK_SIZE=block_size,
         )
 
-        return output_data.reshape(A.shape), {
+        return output_data, {
             "scales": scales,
             "mins": mins,
-            "shape": A.shape,
             "block_size": block_size,
         }
 
     def dequantize_state_triton(A, quant_state):
         n_elements = A.numel()
 
-        output = torch.empty(quant_state["shape"], dtype=torch.float32, device=A.device)
+        output_data = torch.empty_like(A, dtype=torch.float32, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         dequantize_kernel[grid](
-            output.flatten(),
-            A.flatten(),
+            output_data,
+            A,
             quant_state["scales"],
             quant_state["mins"],
             n_elements,
@@ -142,7 +141,7 @@ try:
             BLOCK_SIZE=1024,  # TODO: Tune
         )
 
-        return output
+        return output_data
 
     def add_stochastic_triton(A, B, alpha=1.0, seed=None):
         n = A.numel()
