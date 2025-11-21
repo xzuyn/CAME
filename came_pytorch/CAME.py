@@ -100,15 +100,16 @@ try:
     def quantize_state_triton_rhe(A, block_size):
         n_elements = A.numel()
         if n_elements <= 1:
-            return A
+            return A, {}
 
+        shape = A.shape
         num_blocks = (n_elements + block_size - 1) // block_size
         mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
         scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         quantize_kernel_rhe[grid](
-            A,
+            A.flatten(),
             scales,
             mins,
             n_elements,
@@ -120,6 +121,7 @@ try:
             "scales": scales,
             "mins": mins,
             "block_size": block_size,
+            "shape": shape,
         }
 
     def dequantize_state_triton(A, quant_state):
@@ -127,7 +129,7 @@ try:
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         dequantize_kernel[grid](
-            A,
+            A.flatten(),
             quant_state["scales"],
             quant_state["mins"],
             n_elements,
@@ -135,11 +137,11 @@ try:
             BLOCK_SIZE=1024,  # TODO: Tune
         )
 
-        return A
+        return A.reshape(quant_state["shape"])
 
     def add_stochastic_triton(A, B, alpha=1.0, seed=None):
-        n = A.numel()
-        if n == 0:
+        n_elements = A.numel()
+        if n_elements == 0:
             return
 
         B = B.clone() if B.dtype == torch.float32 else B.to(dtype=torch.float32)
@@ -148,13 +150,13 @@ try:
         if seed is None:
             seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
 
-        grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
+        grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         add_stochastic_kernel[grid](
             A,
             B,
             float(alpha),
             seed,
-            n,
+            n_elements,
             BLOCK_SIZE=1024,
         )
 
@@ -375,6 +377,7 @@ class CAME(Optimizer):
 
         num_blocks = (n_elements + block_size - 1) // block_size
 
+        shape = A.shape
         A = A.unsqueeze(0)
         A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "replicate")
         A = A.squeeze(0)
@@ -396,6 +399,7 @@ class CAME(Optimizer):
             "scales": scales,
             "mins": block_mins,
             "block_size": block_size,
+            "shape": shape,
         }
 
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
@@ -413,7 +417,7 @@ class CAME(Optimizer):
         A = A.flatten()
         A = A[:n_elements]
 
-        return A
+        return A.reshape(quant_state["shape"])
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
     @staticmethod
