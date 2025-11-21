@@ -8,9 +8,8 @@ try:
     import triton.language as tl
 
     @triton.jit
-    def quantize_kernel_rhe(
-        output_ptr,
-        input_ptr,
+    def quantize_kernel_rhe(  # round-half-even
+        a_ptr,
         scale_ptr,
         min_ptr,
         n_elements,
@@ -22,24 +21,24 @@ try:
         offsets = block_start + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
 
-        vals = tl.load(input_ptr + offsets, mask=mask)
+        A = tl.load(a_ptr + offsets, mask=mask)
 
-        chunk_min = tl.min(tl.where(mask, vals, float("inf")), axis=0)
-        scale = (tl.max(tl.where(mask, vals, float("-inf")), axis=0) - chunk_min) / 255.0
+        chunk_min = tl.min(tl.where(mask, A, float("inf")), axis=0)
+        scale = (tl.max(tl.where(mask, A, float("-inf")), axis=0) - chunk_min) / 255.0
 
         is_scale_zero = scale == 0.0
-        vals_scaled = (vals - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
-        floor_val = tl.floor(vals_scaled)
+        A_scaled = (A - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
+        floor_val = tl.floor(A_scaled)
 
-        quantized_data = tl.where(
-            ((vals_scaled - floor_val) == 0.5) & ((floor_val.to(tl.int32) % 2) == 0),
+        A = tl.where(
+            ((A_scaled - floor_val) == 0.5) & ((floor_val.to(tl.int32) % 2) == 0),
             floor_val,
-            tl.floor(vals_scaled + 0.5),
+            tl.floor(A_scaled + 0.5),
         )
-        quantized_data = tl.where(is_scale_zero, 0, quantized_data).to(tl.uint8)
+        A = tl.where(is_scale_zero, 0, A).to(tl.uint8)
 
         # store quantized bytes (partial store supported by mask)
-        tl.store(output_ptr + offsets, quantized_data, mask=mask)
+        tl.store(a_ptr + offsets, A, mask=mask)
 
         # store per-block scale & min (only if block exists)
         if pid < NUM_QUANT_BLOCKS:
@@ -48,8 +47,7 @@ try:
 
     @triton.jit
     def dequantize_kernel(
-        output_ptr,
-        data_ptr,
+        a_ptr,
         scale_ptr,
         min_ptr,
         n_elements,
@@ -63,13 +61,14 @@ try:
 
         quant_block_idx = offsets // QUANT_BLOCK_SIZE
 
+        A = tl.load(a_ptr + offsets, mask=mask)
         scale = tl.load(scale_ptr + quant_block_idx, mask=mask)
         min_val = tl.load(min_ptr + quant_block_idx, mask=mask)
-        quantized_data = tl.load(data_ptr + offsets, mask=mask)
 
-        dequantized_data = quantized_data.to(tl.float32) * scale + min_val
+        A = A.to(tl.float32)
+        A = A * scale + min_val
 
-        tl.store(output_ptr + offsets, dequantized_data, mask=mask)
+        tl.store(a_ptr + offsets, A, mask=mask)
 
     @triton.jit
     def add_stochastic_kernel(
@@ -106,11 +105,9 @@ try:
         num_blocks = (n_elements + block_size - 1) // block_size
         mins = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
         scales = torch.empty((num_blocks,), dtype=torch.float32, device=A.device)
-        output_data = torch.empty_like(A, dtype=torch.uint8, device=A.device)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         quantize_kernel_rhe[grid](
-            output_data,
             A,
             scales,
             mins,
@@ -119,7 +116,7 @@ try:
             BLOCK_SIZE=block_size,
         )
 
-        return output_data, {
+        return A, {
             "scales": scales,
             "mins": mins,
             "block_size": block_size,
@@ -128,11 +125,8 @@ try:
     def dequantize_state_triton(A, quant_state):
         n_elements = A.numel()
 
-        output_data = torch.empty_like(A, dtype=torch.float32, device=A.device)
-
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         dequantize_kernel[grid](
-            output_data,
             A,
             quant_state["scales"],
             quant_state["mins"],
@@ -141,18 +135,14 @@ try:
             BLOCK_SIZE=1024,  # TODO: Tune
         )
 
-        return output_data
+        return A
 
     def add_stochastic_triton(A, B, alpha=1.0, seed=None):
         n = A.numel()
         if n == 0:
             return
 
-        B = (
-            B.clone()
-            if B.dtype == torch.float32
-            else B.to(dtype=torch.float32)
-        )
+        B = B.clone() if B.dtype == torch.float32 else B.to(dtype=torch.float32)
         assert B.is_contiguous()
 
         if seed is None:
@@ -160,8 +150,8 @@ try:
 
         grid = lambda meta: (triton.cdiv(n, meta["BLOCK_SIZE"]),)
         add_stochastic_kernel[grid](
-            A.flatten(),
-            B.flatten(),
+            A,
+            B,
             float(alpha),
             seed,
             n,
@@ -383,10 +373,8 @@ class CAME(Optimizer):
         if n_elements <= 1:
             return A, {}
 
-        shape = A.shape
         num_blocks = (n_elements + block_size - 1) // block_size
 
-        A = A.flatten()
         A = A.unsqueeze(0)
         A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "replicate")
         A = A.squeeze(0)
@@ -404,10 +392,9 @@ class CAME(Optimizer):
         A = A.flatten()
         A = A[:n_elements]
 
-        return A.reshape(shape), {
+        return A, {
             "scales": scales,
             "mins": block_mins,
-            "shape": shape,
             "block_size": block_size,
         }
 
@@ -418,7 +405,6 @@ class CAME(Optimizer):
 
         num_blocks = (n_elements + block_size - 1) // block_size
 
-        A = A.flatten()
         A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "constant", 0)
         A = A.view(num_blocks, block_size)
         A = A.float()
@@ -427,7 +413,7 @@ class CAME(Optimizer):
         A = A.flatten()
         A = A[:n_elements]
 
-        return A.reshape(quant_state["shape"])
+        return A
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
     @staticmethod
