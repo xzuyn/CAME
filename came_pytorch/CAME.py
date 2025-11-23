@@ -9,10 +9,10 @@ class CAME(Optimizer):
 
     This implementation is based on:
       - CAME: Confidence-guided Adaptive Memory Efficient Optimization (https://arxiv.org/abs/2307.02047)
-      - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192) - Translated to Triton
+      - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192)
       - Cautious Optimizers: Improving Training with One Line of Code (https://arxiv.org/abs/2411.16085)
       - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer
-        (https://arxiv.org/abs/2501.18427) - Translated to Triton
+        (https://arxiv.org/abs/2501.18427)
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups
