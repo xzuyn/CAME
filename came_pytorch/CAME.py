@@ -29,10 +29,14 @@ def quantize_kernel_sr(  # stochastic-rounding
 
     A_fp32 = (A_fp32 - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
 
-    # stochastic-rounding
+    # stochastic rounding to nearest int
     A_fp32 = A_fp32 + tl.rand((seed + offsets + pid).to(tl.uint32), offsets)
     A_fp32 = tl.floor(A_fp32)
+
+    # clamp to 0..255
     A_fp32 = tl.where(is_scale_zero, 0, A_fp32)
+    A_fp32 = tl.where(A_fp32 < 0, 0, A_fp32)
+    A_fp32 = tl.where(A_fp32 > 255, 255, A_fp32)
 
     # store quantized bytes (partial store supported by mask)
     tl.store(a_quant_ptr + offsets, A_fp32.to(tl.uint8), mask=mask)
@@ -86,22 +90,21 @@ def add_stochastic_kernel(
     A_bf16 = tl.load(a_ptr + offsets, mask=mask)
     B_fp32 = tl.load(b_ptr + offsets, mask=mask)
 
-    # cast A from bf16 to fp32
+    # cast A from bf16 to fp32 (adds 16 empty bits to the mantissa)
     A_fp32 = A_bf16.cast(tl.float32)
-
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
 
-    # stochastic-rounding
-    # bitcast A from fp32 to u32
+    # stochastic rounding to nearest bf16 decimal
+    # bitcast A from fp32 to u32 so we can do bit manipulation
     A_u32 = A_fp32.cast(tl.uint32, bitcast=True)
-    # create u32 random noise, mask off upper 16 bits, and add into A
+    # create u32 random noise, mask off its upper 16 bits, and add into A
     A_u32 = A_u32 + (tl.randint((seed + offsets + pid).to(tl.uint32), offsets) & 0xFFFF)
     # mask off the lower 16 bits of A
     A_u32 = A_u32 & 0xFFFF0000
     # bitcast the masked A from u32 to fp32
     A_fp32 = A_u32.cast(tl.float32, bitcast=True)
-    # cast A from fp32 to bf16
+    # cast A from fp32 to bf16 (drop the extra 16 bits in the mantissa)
     A_bf16 = A_fp32.cast(tl.bfloat16)
 
     tl.store(a_ptr + offsets, A_bf16, mask=mask)
