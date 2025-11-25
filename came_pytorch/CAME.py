@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 
+# Reference: https://github.com/NVlabs/Sana/blob/7840b88415bfd1adfff097dc0c3987d45c059660/diffusion/utils/optimizer.py#L537C5-L563C32
 @triton.jit
 def quantize_kernel_sr(  # stochastic-rounding
     a_ptr,  # fp32
@@ -46,6 +47,7 @@ def quantize_kernel_sr(  # stochastic-rounding
         tl.store(scale_ptr + pid, scale)
         tl.store(min_ptr + pid, chunk_min)
 
+# Reference: https://github.com/NVlabs/Sana/blob/7840b88415bfd1adfff097dc0c3987d45c059660/diffusion/utils/optimizer.py#L565C5-L582C33
 @triton.jit
 def dequantize_kernel(
     a_ptr,  # uint8
@@ -72,6 +74,7 @@ def dequantize_kernel(
 
     tl.store(a_dequant_ptr + offsets, A_fp32, mask=mask)
 
+# Reference: https://github.com/Nerogar/OneTrainer/blob/062443014f380637a2bf8ddaeb2ff9259599ecab/modules/util/bf16_stochastic_rounding.py#L12C1-L57C36
 @triton.jit
 def add_stochastic_kernel(
     a_ptr,  # bf16
