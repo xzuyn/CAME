@@ -95,6 +95,7 @@ def add_stochastic_kernel(
 
     # cast A from bf16 to fp32 (adds 16 empty bits to the mantissa)
     A_fp32 = A_bf16.cast(tl.float32)
+
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
 
@@ -378,25 +379,14 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_quantization:
-                    state["exp_avg_sq"], state["exp_avg_quant_state"] = self.quantize_state_triton_sr(
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self.quantize_state_triton_sr(
                         A_fp32=torch.zeros_like(grad),
                         block_size=group["block_size"],
                     )
                 else:
                     state["exp_avg_sq"] = torch.zeros_like(grad)
-            state["RMS"] = 0
 
         state["step"] += 1
-        state["RMS"] = self._rms(p.data)
-
-        # load / dequantize first moment
-        if use_quantization:
-            exp_avg = self.dequantize_state_triton(
-                A_u8=state["exp_avg"],
-                quant_state=state["exp_avg_quant_state"]
-            )
-        else:
-            exp_avg = state["exp_avg"]
 
         update = (grad ** 2) + group["eps"][0]
         if factored:
@@ -420,6 +410,7 @@ class CAME(Optimizer):
                 exp_avg_sq = state["exp_avg_sq"]
 
             exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
+            update = exp_avg_sq.rsqrt().mul_(grad)
 
             if use_quantization:
                 state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self.quantize_state_triton_sr(
@@ -429,21 +420,18 @@ class CAME(Optimizer):
             else:
                 state["exp_avg_sq"] = exp_avg_sq
 
-            update = exp_avg_sq.rsqrt().mul_(grad)
-
         update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+
+        if use_quantization:
+            exp_avg = self.dequantize_state_triton(
+                A_u8=state["exp_avg"],
+                quant_state=state["exp_avg_quant_state"]
+            )
+        else:
+            exp_avg = state["exp_avg"]
 
         # update first moment
         exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
-
-        # re-quantize first moment if using quantization
-        if use_quantization:
-            state["exp_avg"], state["exp_avg_quant_state"] = self.quantize_state_triton_sr(
-                A_fp32=exp_avg,
-                block_size=group["block_size"],
-            )
-        else:
-            state["exp_avg"] = exp_avg
 
         # Confidence-guided strategy
         # Calculation of instability
@@ -461,6 +449,14 @@ class CAME(Optimizer):
             update = res_approx.mul_(exp_avg)
         else:
             update = exp_avg.clone()
+
+        if use_quantization:
+            state["exp_avg"], state["exp_avg_quant_state"] = self.quantize_state_triton_sr(
+                A_fp32=exp_avg,
+                block_size=group["block_size"],
+            )
+        else:
+            state["exp_avg"] = exp_avg
 
         if group["enable_cautious"]:
             mask = (update * grad > 0).to(grad.dtype)
