@@ -20,12 +20,11 @@ def add_stochastic_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # load A and B
-    A_bf16 = tl.load(a_ptr + offsets, mask=mask)
-    B_fp32 = tl.load(b_ptr + offsets, mask=mask)
+    # load A and cast from bf16 to fp32 (adds 16 empty bits to the mantissa)
+    A_fp32 = tl.load(a_ptr + offsets, mask=mask).cast(tl.float32)
 
-    # cast A from bf16 to fp32 (adds 16 empty bits to the mantissa)
-    A_fp32 = A_bf16.cast(tl.float32)
+    # load B
+    B_fp32 = tl.load(b_ptr + offsets, mask=mask)
 
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
@@ -52,9 +51,7 @@ def fused_update_exp_avg_sq_kernel(
     exp_avg_sq_ptr,  # uint8
     scale_ptr,  # ???
     min_ptr,  # ???
-    output_ptr,  # fp32
     beta,  # float
-    decay,  # float
     seed,  # float?
     n_elements,  # float?
     NUM_QUANT_BLOCKS: tl.constexpr,
@@ -70,25 +67,26 @@ def fused_update_exp_avg_sq_kernel(
     old_scale = tl.load(scale_ptr + pid, mask=meta_mask)
     old_min = tl.load(min_ptr + pid, mask=meta_mask)
 
-    # Load quantized state
-    state_u8 = tl.load(exp_avg_sq_ptr + offsets, mask=mask)
+    # Load quantized state and convert to fp32
+    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask).to(tl.float32)
 
-    # Load updates
-    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask)
-    grad_val = tl.load(grad_ptr + offsets, mask=mask)
-
-    # Dequantize: uint8 -> fp32
-    state_fp32 = state_u8.to(tl.float32)
+    # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
+    # Load update
+    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask)
+
     # Update EMA: exp_avg_sq.mul_(beta).add_(update, alpha=1-beta)
-    state_fp32 = (state_fp32 * beta) + (update_sq_val * decay)
+    state_fp32 = (state_fp32 * beta) + (update_sq_val * (1.0 - beta))
+
+    # Load grad
+    grad_val = tl.load(grad_ptr + offsets, mask=mask)
 
     # update = exp_avg_sq.rsqrt().mul_(grad)
     output_val = tl.rsqrt(state_fp32) * grad_val
 
-    # Store the calculation result (fp32)
-    tl.store(output_ptr + offsets, output_val, mask=mask)
+    # Store update
+    tl.store(update_sq_ptr + offsets, output_val, mask=mask)
 
     # Calculate new min/max for the block
     chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
@@ -126,7 +124,6 @@ def fused_update_exp_avg_kernel(
     min_ptr,  # fp32
     output_ptr,  # fp32
     beta,  # float
-    decay,  # float
     seed,  # int
     n_elements,  # int
     NUM_QUANT_BLOCKS: tl.constexpr,
@@ -142,18 +139,17 @@ def fused_update_exp_avg_kernel(
     old_scale = tl.load(scale_ptr + pid, mask=meta_mask)
     old_min = tl.load(min_ptr + pid, mask=meta_mask)
 
-    # Load quantized state
-    state_u8 = tl.load(exp_avg_ptr + offsets, mask=mask)
+    # Load quantized state and convert to fp32
+    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask).to(tl.float32)
+
+    # Dequantize
+    state_fp32 = (state_fp32 * old_scale) + old_min
 
     # Load update
     update_val = tl.load(update_ptr + offsets, mask=mask)
 
-    # Dequantize: uint8 -> fp32
-    state_fp32 = state_u8.to(tl.float32)
-    state_fp32 = (state_fp32 * old_scale) + old_min
-
     # Update EMA: exp_avg.mul_(beta).add_(update, alpha=1-beta)
-    state_fp32 = (state_fp32 * beta) + (update_val * decay)
+    state_fp32 = (state_fp32 * beta) + (update_val * (1.0 - beta))
 
     # Store the updated exp_avg (fp32) for subsequent instability calculation
     tl.store(output_ptr + offsets, state_fp32, mask=mask)
@@ -186,30 +182,29 @@ def fused_update_exp_avg_kernel(
         tl.store(min_ptr + pid, chunk_min)
 
 
-def add_stochastic_triton(A_bf16, B_fp32, alpha=1.0):
+def add_stochastic_triton(A_bf16, B, alpha=1.0):
     n_elements = A_bf16.numel()
     if n_elements == 0:
         return A_bf16
 
-    assert A_bf16.shape == B_fp32.shape
+    assert A_bf16.shape == B.shape
     assert A_bf16.dtype == torch.bfloat16
     assert A_bf16.is_contiguous()
 
     with torch.no_grad():
-        if B_fp32.dtype != torch.float32:
-            B_fp32 = B_fp32.to(dtype=torch.float32)
+        B = B.contiguous()
 
         shape = A_bf16.shape
 
         A_bf16 = A_bf16.view(-1)
-        B_fp32 = B_fp32.view(-1)
+        B = B.view(-1)
 
         seed = torch.randint(0, 2**32 - 1, (1,)).item()
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         add_stochastic_kernel[grid](
             A_bf16,
-            B_fp32,
+            B,
             float(alpha),
             seed,
             n_elements,
@@ -229,23 +224,23 @@ def fused_update_exp_avg_sq_triton(
     """
     Fuses: Dequantize -> EMA Update -> Compute Output -> Quantize
 
-    Returns: The computed output (float32)
+    `update_sq` is modified in-place
 
     Should be ~2-4x faster, and use ~0.5x peak memory usage
     """
+
+    assert update_sq.dtype == torch.float32, (
+        "update_sq must be float32 as it will be stored as float32"
+    )
+    assert update_sq.is_contiguous(), (
+        "update_sq must be contiguous as it is modified in-place"
+    )
+
     n_elements = grad.numel()
-
-    # Ensure inputs are correct types/contiguous
-    if update_sq.dtype != torch.float32:
-        update_sq = update_sq.float()
-
-    # Output tensor
-    output = torch.empty_like(grad, dtype=torch.float32)
 
     # Flatten views for kernel
     grad_flat = grad.view(-1)
     update_sq_flat = update_sq.view(-1)
-    output_flat = output.view(-1)
     state_u8_flat = exp_avg_sq_u8.view(-1)
 
     # Quantization metadata
@@ -255,7 +250,6 @@ def fused_update_exp_avg_sq_triton(
     num_blocks = scales.numel()
 
     seed = torch.randint(0, 2**32 - 1, (1,)).item()
-    decay = 1.0 - beta
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
@@ -265,16 +259,12 @@ def fused_update_exp_avg_sq_triton(
         state_u8_flat,
         scales,
         mins,
-        output_flat,
         float(beta),
-        float(decay),
         seed,
         n_elements,
         NUM_QUANT_BLOCKS=num_blocks,
         BLOCK_SIZE=block_size,
     )
-
-    return output
 
 
 def fused_update_exp_avg_triton(
@@ -309,7 +299,6 @@ def fused_update_exp_avg_triton(
     num_blocks = scales.numel()
 
     seed = torch.randint(0, 2**32 - 1, (1,)).item()
-    decay = 1.0 - beta
 
     grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
 
@@ -320,7 +309,6 @@ def fused_update_exp_avg_triton(
         mins,
         output_flat,
         float(beta),
-        float(decay),
         seed,
         n_elements,
         NUM_QUANT_BLOCKS=num_blocks,
@@ -557,7 +545,9 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment
             if use_quantization:
-                update = fused_update_exp_avg_sq_triton(
+                # update is modified in-place
+                # update must be fp32 and contiguous
+                fused_update_exp_avg_sq_triton(
                     grad=grad,
                     update_sq=update,
                     exp_avg_sq_u8=state["exp_avg_sq"],
@@ -590,11 +580,11 @@ class CAME(Optimizer):
             # update first moment
             exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
 
-        # Confidence-guided strategy
-        # Calculation of instability
-        res = (update - exp_avg) ** 2 + group["eps"][1]
-
         if factored:
+            # Confidence-guided strategy
+            # Calculation of instability
+            res = (update - exp_avg) ** 2 + group["eps"][1]
+
             exp_avg_res_row = state["exp_avg_res_row"]
             exp_avg_res_col = state["exp_avg_res_col"]
 
@@ -623,7 +613,7 @@ class CAME(Optimizer):
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
                 add_stochastic_triton(
                     A_bf16=p.data,
-                    B_fp32=p.data.float(),
+                    B=p.data,
                     alpha=-group["weight_decay"] * group["lr"],
                 )
             else:
@@ -633,7 +623,7 @@ class CAME(Optimizer):
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
             add_stochastic_triton(
                 A_bf16=p.data,
-                B_fp32=-update.float(),
+                B=-update,
             )
         else:
             p.data.add_(-update)
