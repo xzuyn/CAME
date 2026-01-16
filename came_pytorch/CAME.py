@@ -280,11 +280,9 @@ def fused_update_exp_avg_triton(
     """
     n_elements = update.numel()
 
-    # Ensure inputs are correct types
-    if update.dtype != torch.float32:
-        update = update.float()
+    assert update.dtype == torch.float32
+    assert update.is_contiguous()
 
-    # Output tensor
     output = torch.empty_like(update, dtype=torch.float32)
 
     # Flatten views for kernel
@@ -337,6 +335,7 @@ class CAME(Optimizer):
       - CAME: Confidence-guided Adaptive Memory Efficient Optimization (https://arxiv.org/abs/2307.02047)
       - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192) - Translated to Triton
       - Cautious Optimizers: Improving Training with One Line of Code (https://arxiv.org/abs/2411.16085)
+      - Cautious Weight Decay (https://arxiv.org/abs/2510.12402)
       - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer
         (https://arxiv.org/abs/2501.18427) - Translated to Triton
 
@@ -352,6 +351,8 @@ class CAME(Optimizer):
         enable_stochastic_rounding (bool, optional): utilize stochastic rounding with bfloat16 (default: False)
         enable_cautious (bool, optional): mask out update components whose sign
             conflicts with the gradient, boosting only aligned directions (default: False)
+        enable_cautious_weight_decay (bool, optional): only apply weight decay when the parameter
+            and the update have the same sign (default: False)
         enable_8bit (bool, optional): enable 8-bit quantization for large layers (default: False)
         block_size (int, optional): quantization block size for 8-bit (default: 2048)
         min_quant_size (int, optional): minimum number of parameters to use quantization (default: 16384)
@@ -368,6 +369,7 @@ class CAME(Optimizer):
         weight_decay=0.0,
         enable_stochastic_rounding=False,
         enable_cautious=False,
+        enable_cautious_weight_decay=False,
         enable_8bit=False,
         block_size=256,
         min_quant_size=16384,
@@ -386,6 +388,7 @@ class CAME(Optimizer):
             weight_decay=weight_decay,
             enable_stochastic_rounding=enable_stochastic_rounding,
             enable_cautious=enable_cautious,
+            enable_cautious_weight_decay=enable_cautious_weight_decay,
             enable_8bit=enable_8bit,
             block_size=block_size,
             min_quant_size=min_quant_size,
@@ -398,6 +401,7 @@ class CAME(Optimizer):
             for user_option in [
                 enable_stochastic_rounding,
                 enable_cautious,
+                enable_cautious_weight_decay,
                 enable_8bit,
                 enable_gc,
             ]
@@ -407,6 +411,8 @@ class CAME(Optimizer):
                 print(f"- Stochastic Rounding enabled.")
             if enable_cautious:
                 print("- Cautious Masking enabled.")
+            if enable_cautious_weight_decay:
+                print("- Cautious Weight Decay enabled.")
             if enable_8bit:
                 print(
                     f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}."
@@ -568,6 +574,7 @@ class CAME(Optimizer):
             ).clamp_(min=1.0)
         )
 
+        # update first moment
         if use_quantization:
             exp_avg = fused_update_exp_avg_triton(
                 update=update,
@@ -577,7 +584,6 @@ class CAME(Optimizer):
             )
         else:
             exp_avg = state["exp_avg"]
-            # update first moment
             exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
 
         if factored:
@@ -610,14 +616,19 @@ class CAME(Optimizer):
             update.mul_(mask)
 
         if group["weight_decay"] != 0:
+            decay_src = p.data
+            if group["enable_cautious_weight_decay"]:
+                mask = (update * p.data >= 0)
+                decay_src = decay_src * mask
+
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
                 add_stochastic_triton(
                     A_bf16=p.data,
-                    B=p.data,
+                    B=decay_src,
                     alpha=-group["weight_decay"] * group["lr"],
                 )
             else:
-                p.data.add_(p.data, alpha=-group["weight_decay"] * group["lr"])
+                p.data.add_(decay_src, alpha=-group["weight_decay"] * group["lr"])
 
         update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
