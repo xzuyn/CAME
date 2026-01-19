@@ -349,7 +349,7 @@ class CAME(Optimizer):
             update, square gradient and instability (default: (0.9, 0.999, 0.9999)))
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         enable_stochastic_rounding (bool, optional): utilize stochastic rounding with bfloat16 (default: False)
-        enable_cautious (bool, optional): mask out update components whose sign
+        enable_cautious_update (bool, optional): mask out update components whose sign
             conflicts with the gradient, boosting only aligned directions (default: False)
         enable_cautious_weight_decay (bool, optional): only apply weight decay when the parameter
             and the update have the same sign (default: False)
@@ -368,7 +368,7 @@ class CAME(Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         enable_stochastic_rounding=False,
-        enable_cautious=False,
+        enable_cautious_update=False,
         enable_cautious_weight_decay=False,
         enable_8bit=False,
         block_size=256,
@@ -387,7 +387,7 @@ class CAME(Optimizer):
             betas=betas,
             weight_decay=weight_decay,
             enable_stochastic_rounding=enable_stochastic_rounding,
-            enable_cautious=enable_cautious,
+            enable_cautious_update=enable_cautious_update,
             enable_cautious_weight_decay=enable_cautious_weight_decay,
             enable_8bit=enable_8bit,
             block_size=block_size,
@@ -400,7 +400,7 @@ class CAME(Optimizer):
             user_option is False
             for user_option in [
                 enable_stochastic_rounding,
-                enable_cautious,
+                enable_cautious_update,
                 enable_cautious_weight_decay,
                 enable_8bit,
                 enable_gc,
@@ -409,8 +409,8 @@ class CAME(Optimizer):
             print("\n==== CAME Modifications ====")
             if enable_stochastic_rounding:
                 print(f"- Stochastic Rounding enabled.")
-            if enable_cautious:
-                print("- Cautious Masking enabled.")
+            if enable_cautious_update:
+                print("- Cautious Update enabled.")
             if enable_cautious_weight_decay:
                 print("- Cautious Weight Decay enabled.")
             if enable_8bit:
@@ -586,10 +586,16 @@ class CAME(Optimizer):
             exp_avg = state["exp_avg"]
             exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
 
+        masked_exp_avg = exp_avg
+        if group["enable_cautious_update"]:
+            mask = (masked_exp_avg * grad > 0).to(grad.dtype)
+            mask.div_(mask.mean().clamp_(min=1e-3))
+            masked_exp_avg = masked_exp_avg * mask
+
         if factored:
             # Confidence-guided strategy
             # Calculation of instability
-            res = (update - exp_avg) ** 2 + group["eps"][1]
+            res = (update - masked_exp_avg) ** 2 + group["eps"][1]
 
             exp_avg_res_row = state["exp_avg_res_row"]
             exp_avg_res_col = state["exp_avg_res_col"]
@@ -603,23 +609,21 @@ class CAME(Optimizer):
 
             # Approximation of exponential moving average of instability
             res_approx = _approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
-            update = res_approx.mul_(exp_avg)
+            confidence_factor = res_approx
+            update = res_approx.mul_(masked_exp_avg)
         else:
-            update = exp_avg.clone()
+            update = masked_exp_avg.clone()
 
         if not use_quantization:
             state["exp_avg"] = exp_avg
-
-        if group["enable_cautious"]:
-            mask = (update * grad > 0).to(grad.dtype)
-            mask.div_(mask.mean().clamp_(min=1e-3))
-            update.mul_(mask)
 
         if group["weight_decay"] != 0:
             decay_src = p.data
             if group["enable_cautious_weight_decay"]:
                 mask = (update * p.data >= 0)
                 decay_src = decay_src * mask
+                if factored:
+                    decay_src.mul_(confidence_factor)
 
             if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
                 add_stochastic_triton(
