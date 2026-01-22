@@ -625,23 +625,16 @@ class CAME(Optimizer):
                 if factored:
                     decay_src.mul_(confidence_factor)
 
-            if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
-                add_stochastic_triton(
-                    A_bf16=p.data,
-                    B=decay_src,
-                    alpha=-group["weight_decay"] * group["lr"],
-                )
-            else:
-                p.data.add_(decay_src, alpha=-group["weight_decay"] * group["lr"])
+            update.add_(decay_src, alpha=group["weight_decay"])
 
-        update.mul_(group["lr"])
         if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
             add_stochastic_triton(
                 A_bf16=p.data,
-                B=-update,
+                B=update,
+                alpha=-group["lr"],
             )
         else:
-            p.data.add_(-update)
+            p.data.add_(update, alpha=-group["lr"])
 
     @torch.inference_mode()
     def step(self, closure=None):
