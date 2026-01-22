@@ -21,11 +21,11 @@ def add_stochastic_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # load A and cast from bf16 to fp32 (adds 16 empty bits to the mantissa)
-    A_fp32 = tl.load(a_ptr + offsets, mask=mask).cast(tl.float32)
+    # Load A and cast from bf16 to fp32 (adds 16 empty bits to the mantissa)
+    A_fp32 = tl.load(a_ptr + offsets, mask=mask, eviction_policy="evict_first").cast(tl.float32)
 
-    # load B
-    B_fp32 = tl.load(b_ptr + offsets, mask=mask)
+    # Load B
+    B_fp32 = tl.load(b_ptr + offsets, mask=mask, eviction_policy="evict_first")
 
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
@@ -69,19 +69,19 @@ def fused_update_exp_avg_sq_kernel(
     old_min = tl.load(min_ptr + pid)
 
     # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
 
     # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
     # Load update
-    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask, other=0.0)
+    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask, other=0.0, eviction_policy="evict_first")
 
     # Update EMA: exp_avg_sq.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_sq_val * (1.0 - beta))
 
     # Load grad
-    grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
+    grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0, eviction_policy="evict_first")
 
     # update = exp_avg_sq.rsqrt().mul_(grad)
     output_val = tl.rsqrt(state_fp32 + 1e-10) * grad_val
@@ -104,15 +104,14 @@ def fused_update_exp_avg_sq_kernel(
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
-    state_norm = tl.maximum(tl.minimum(state_norm, 255.0), 0.0)
+    state_norm = tl.clamp(state_norm, 0.0, 255.0)
 
     # Store State (uint8)
     tl.store(exp_avg_sq_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
 
-    # Store Metadata (only first thread in block writes)
-    if tl.program_id(axis=0) == pid:
-        tl.store(scale_ptr + pid, scale)
-        tl.store(min_ptr + pid, chunk_min)
+    # Store Metadata
+    tl.store(scale_ptr + pid, scale)
+    tl.store(min_ptr + pid, chunk_min)
 
 
 @triton.jit
@@ -138,13 +137,13 @@ def fused_update_exp_avg_kernel(
     old_min = tl.load(min_ptr + pid)
 
     # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0, eviction_policy="evict_first").to(tl.float32)
 
     # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
     # Load update
-    update_val = tl.load(update_ptr + offsets, mask=mask, other=0.0)
+    update_val = tl.load(update_ptr + offsets, mask=mask, other=0.0, eviction_policy="evict_first")
 
     # Update EMA: exp_avg.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_val * (1.0 - beta))
@@ -167,7 +166,7 @@ def fused_update_exp_avg_kernel(
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
-    state_norm = tl.maximum(tl.minimum(state_norm, 255.0), 0.0)
+    state_norm = tl.clamp(state_norm, 0.0, 255.0)
 
     # Store State (uint8)
     tl.store(exp_avg_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
