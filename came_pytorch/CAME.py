@@ -3,6 +3,7 @@ import torch
 from torch.optim import Optimizer
 import triton
 import triton.language as tl
+import random
 
 
 # Reference: https://github.com/Nerogar/OneTrainer/blob/062443014f380637a2bf8ddaeb2ff9259599ecab/modules/util/bf16_stochastic_rounding.py#L12C1-L57C36
@@ -33,7 +34,8 @@ def add_stochastic_kernel(
     # bitcast A from fp32 to u32 so we can do bit manipulation
     A_u32 = A_fp32.cast(tl.uint32, bitcast=True)
     # create u32 random noise, mask off its upper 16 bits, and add into A
-    A_u32 = A_u32 + (tl.randint((seed + offsets + pid).to(tl.uint32), offsets) & 0xFFFF)
+    seeds = seed + offsets + (pid * BLOCK_SIZE)
+    A_u32 = A_u32 + (tl.randint(seeds.to(tl.uint32), offsets) & 0xFFFF)
     # mask off the lower 16 bits of A
     A_u32 = A_u32 & 0xFFFF0000
     # bitcast the masked A from u32 to fp32
@@ -47,71 +49,68 @@ def add_stochastic_kernel(
 @triton.jit
 def fused_update_exp_avg_sq_kernel(
     grad_ptr,  # fp32 or bf16
-    update_sq_ptr,  # ???
+    update_sq_ptr,  # fp32
     exp_avg_sq_ptr,  # uint8
-    scale_ptr,  # ???
-    min_ptr,  # ???
+    scale_ptr,  # fp32
+    min_ptr,  # fp32
     beta,  # float
-    seed,  # float?
-    n_elements,  # float?
-    NUM_QUANT_BLOCKS: tl.constexpr,
+    seed,  # int
+    n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
 ):
+    # Each thread block processes exactly one quantization block
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     # Load metadata (scalars per block)
-    meta_mask = pid < NUM_QUANT_BLOCKS
-    old_scale = tl.load(scale_ptr + pid, mask=meta_mask)
-    old_min = tl.load(min_ptr + pid, mask=meta_mask)
+    old_scale = tl.load(scale_ptr + pid)
+    old_min = tl.load(min_ptr + pid)
 
     # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask).to(tl.float32)
+    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
     # Load update
-    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask)
+    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask, other=0.0)
 
     # Update EMA: exp_avg_sq.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_sq_val * (1.0 - beta))
 
     # Load grad
-    grad_val = tl.load(grad_ptr + offsets, mask=mask)
+    grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
 
     # update = exp_avg_sq.rsqrt().mul_(grad)
-    output_val = tl.rsqrt(state_fp32) * grad_val
+    output_val = tl.rsqrt(state_fp32 + 1e-10) * grad_val
 
     # Store update
     tl.store(update_sq_ptr + offsets, output_val, mask=mask)
 
-    # Calculate new min/max for the block
+    # Calculate new min/max for this quantization block
     chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
     chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
 
-    scale = (chunk_max - chunk_min) / 255.0
-    is_scale_zero = scale == 0.0
+    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-10)
 
     # Normalize
-    state_norm = (state_fp32 - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
+    state_norm = (state_fp32 - chunk_min) / scale
 
     # Stochastic Rounding
-    state_norm = state_norm + tl.rand((seed + offsets + pid).to(tl.uint32), offsets)
+    seeds = seed + offsets + (pid * BLOCK_SIZE)
+    state_norm = state_norm + tl.rand(seeds.to(tl.uint32), offsets)
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
-    state_norm = tl.where(is_scale_zero, 0, state_norm)
-    state_norm = tl.where(state_norm < 0, 0, state_norm)
-    state_norm = tl.where(state_norm > 255, 255, state_norm)
+    state_norm = tl.maximum(tl.minimum(state_norm, 255.0), 0.0)
 
     # Store State (uint8)
     tl.store(exp_avg_sq_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
 
-    # Store Metadata
-    if meta_mask:
+    # Store Metadata (only first thread in block writes)
+    if tl.program_id(axis=0) == pid:
         tl.store(scale_ptr + pid, scale)
         tl.store(min_ptr + pid, chunk_min)
 
@@ -126,27 +125,26 @@ def fused_update_exp_avg_kernel(
     beta,  # float
     seed,  # int
     n_elements,  # int
-    NUM_QUANT_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    # Each thread block processes exactly one quantization block
     pid = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
     # Load metadata (scalars per block)
-    meta_mask = pid < NUM_QUANT_BLOCKS
-    old_scale = tl.load(scale_ptr + pid, mask=meta_mask)
-    old_min = tl.load(min_ptr + pid, mask=meta_mask)
+    old_scale = tl.load(scale_ptr + pid)
+    old_min = tl.load(min_ptr + pid)
 
     # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask).to(tl.float32)
+    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
     # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
     # Load update
-    update_val = tl.load(update_ptr + offsets, mask=mask)
+    update_val = tl.load(update_ptr + offsets, mask=mask, other=0.0)
 
     # Update EMA: exp_avg.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_val * (1.0 - beta))
@@ -154,30 +152,28 @@ def fused_update_exp_avg_kernel(
     # Store the updated exp_avg (fp32) for subsequent instability calculation
     tl.store(output_ptr + offsets, state_fp32, mask=mask)
 
-    # Calculate new min/max for the block
+    # Calculate new min/max for this quantization block
     chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
     chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
 
-    scale = (chunk_max - chunk_min) / 255.0
-    is_scale_zero = scale == 0.0
+    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-10)
 
     # Normalize
-    state_norm = (state_fp32 - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
+    state_norm = (state_fp32 - chunk_min) / scale
 
     # Stochastic Rounding
-    state_norm = state_norm + tl.rand((seed + offsets + pid).to(tl.uint32), offsets)
+    seeds = seed + offsets + (pid * BLOCK_SIZE)
+    state_norm = state_norm + tl.rand(seeds.to(tl.uint32), offsets)
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
-    state_norm = tl.where(is_scale_zero, 0, state_norm)
-    state_norm = tl.where(state_norm < 0, 0, state_norm)
-    state_norm = tl.where(state_norm > 255, 255, state_norm)
+    state_norm = tl.maximum(tl.minimum(state_norm, 255.0), 0.0)
 
     # Store State (uint8)
     tl.store(exp_avg_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
 
-    # Store Metadata
-    if meta_mask:
+    # Store Metadata (only first thread in block writes)
+    if tl.program_id(axis=0) == pid:
         tl.store(scale_ptr + pid, scale)
         tl.store(min_ptr + pid, chunk_min)
 
@@ -199,7 +195,7 @@ def add_stochastic_triton(A_bf16, B, alpha=1.0):
         A_bf16 = A_bf16.view(-1)
         B = B.view(-1)
 
-        seed = torch.randint(0, 2**32 - 1, (1,)).item()
+        seed = random.randint(0, 2**32 - 1)
 
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
         add_stochastic_kernel[grid](
@@ -249,9 +245,10 @@ def fused_update_exp_avg_sq_triton(
     block_size = quant_state["block_size"]
     num_blocks = scales.numel()
 
-    seed = torch.randint(0, 2**32 - 1, (1,)).item()
+    seed = random.randint(0, 2**32 - 1)
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    # Launch one thread block per quantization block
+    grid = (num_blocks,)
 
     fused_update_exp_avg_sq_kernel[grid](
         grad_flat,
@@ -262,7 +259,6 @@ def fused_update_exp_avg_sq_triton(
         float(beta),
         seed,
         n_elements,
-        NUM_QUANT_BLOCKS=num_blocks,
         BLOCK_SIZE=block_size,
     )
 
@@ -296,9 +292,10 @@ def fused_update_exp_avg_triton(
     block_size = quant_state["block_size"]
     num_blocks = scales.numel()
 
-    seed = torch.randint(0, 2**32 - 1, (1,)).item()
+    seed = random.randint(0, 2**32 - 1)
 
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+    # Launch one thread block per quantization block
+    grid = (num_blocks,)
 
     fused_update_exp_avg_kernel[grid](
         update_flat,
@@ -309,7 +306,6 @@ def fused_update_exp_avg_triton(
         float(beta),
         seed,
         n_elements,
-        NUM_QUANT_BLOCKS=num_blocks,
         BLOCK_SIZE=block_size,
     )
 
@@ -318,11 +314,8 @@ def fused_update_exp_avg_triton(
 
 # TODO: Implement in triton?
 def _approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col):
-    r_factor = (
-        (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True))
-        .rsqrt_()
-        .unsqueeze(-1)
-    )
+    row_mean = exp_avg_sq_row.mean(dim=-1, keepdim=True)
+    r_factor = (exp_avg_sq_row / row_mean).rsqrt().unsqueeze(-1)
     c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
     return torch.mul(r_factor, c_factor)
 
@@ -356,7 +349,6 @@ class CAME(Optimizer):
         enable_8bit (bool, optional): enable 8-bit quantization for large layers (default: False)
         block_size (int, optional): quantization block size for 8-bit (default: 2048)
         min_quant_size (int, optional): minimum number of parameters to use quantization (default: 16384)
-        enable_gc (bool, optional): enable garbage collection before each step (default: False)
     """
 
     def __init__(
@@ -373,7 +365,6 @@ class CAME(Optimizer):
         enable_8bit=False,
         block_size=256,
         min_quant_size=16384,
-        enable_gc=False,
     ):
         self.torch_gc()
 
@@ -392,7 +383,6 @@ class CAME(Optimizer):
             enable_8bit=enable_8bit,
             block_size=block_size,
             min_quant_size=min_quant_size,
-            enable_gc=enable_gc,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -403,7 +393,6 @@ class CAME(Optimizer):
                 enable_cautious_update,
                 enable_cautious_weight_decay,
                 enable_8bit,
-                enable_gc,
             ]
         ):
             print("\n==== CAME Modifications ====")
@@ -417,8 +406,6 @@ class CAME(Optimizer):
                 print(
                     f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}."
                 )
-            if enable_gc:
-                print("- Garbage Collection enabled.")
             print("==== CAME Modifications ====\n")
 
     @property
@@ -428,21 +415,6 @@ class CAME(Optimizer):
     @property
     def supports_flat_params(self):
         return False
-
-    # https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L523C1-L535C55
-    def _should_use_quantization(self, param_shape):
-        """Determine if a parameter should be quantized
-
-        Rules:
-        1. linear layers: parameter size > min_quant_size
-        2. 1x1 conv layers: parameter size > min_quant_size
-        3. other layers: use 32bit
-        """
-        if len(param_shape) == 2:  # linear layer
-            return param_shape[0] * param_shape[1] > self.defaults["min_quant_size"]
-        elif len(param_shape) == 4 and param_shape[2] == 1 and param_shape[3] == 1:
-            return param_shape[0] * param_shape[1] > self.defaults["min_quant_size"]
-        return False  # other layers are not quantized
 
     # https://github.com/Nerogar/OneTrainer/blob/master/modules/util/torch_util.py
     @staticmethod
@@ -475,9 +447,7 @@ class CAME(Optimizer):
         grad_shape = grad.shape
 
         factored = len(grad_shape) >= 2
-        use_quantization = group["enable_8bit"] and self._should_use_quantization(
-            grad_shape
-        )
+        use_quantization = group["enable_8bit"] and grad.numel() > group["min_quant_size"]
 
         # State Initialization
         if len(state) == 0:
@@ -648,9 +618,6 @@ class CAME(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
-            if group["enable_gc"]:
-                self.torch_gc()
-
             for p in group["params"]:
                 self.step_param(p, group)
 
