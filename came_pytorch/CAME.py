@@ -7,6 +7,19 @@ import random
 
 
 # Reference: https://github.com/Nerogar/OneTrainer/blob/062443014f380637a2bf8ddaeb2ff9259599ecab/modules/util/bf16_stochastic_rounding.py#L12C1-L57C36
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_SIZE": block_size},
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for block_size in [64, 128, 256, 512, 1024]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["n_elements"],
+)
 @triton.jit
 def add_stochastic_kernel(
     a_ptr,  # bf16
@@ -34,8 +47,7 @@ def add_stochastic_kernel(
     # bitcast A from fp32 to u32 so we can do bit manipulation
     A_u32 = A_fp32.cast(tl.uint32, bitcast=True)
     # create u32 random noise, mask off its upper 16 bits, and add into A
-    seeds = seed + offsets + (pid * BLOCK_SIZE)
-    A_u32 = A_u32 + (tl.randint(seeds.to(tl.uint32), offsets) & 0xFFFF)
+    A_u32 = A_u32 + tl.randint(seed, offsets) & 0xFFFF
     # mask off the lower 16 bits of A
     A_u32 = A_u32 & 0xFFFF0000
     # bitcast the masked A from u32 to fp32
@@ -46,6 +58,18 @@ def add_stochastic_kernel(
     tl.store(a_ptr + offsets, A_bf16, mask=mask)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {},  # block_size can't be tuned since it's tied to quantization method
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["n_elements"],
+)
 @triton.jit
 def fused_update_exp_avg_sq_kernel(
     grad_ptr,  # fp32 or bf16
@@ -84,7 +108,7 @@ def fused_update_exp_avg_sq_kernel(
     grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
 
     # update = exp_avg_sq.rsqrt().mul_(grad)
-    output_val = tl.rsqrt(state_fp32 + 1e-10) * grad_val
+    output_val = tl.rsqrt(tl.maximum(state_fp32, 1e-30)) * grad_val
 
     # Store update
     tl.store(update_sq_ptr + offsets, output_val, mask=mask)
@@ -93,14 +117,13 @@ def fused_update_exp_avg_sq_kernel(
     chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
     chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
 
-    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-10)
+    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-30)
 
     # Normalize
     state_norm = (state_fp32 - chunk_min) / scale
 
     # Stochastic Rounding
-    seeds = seed + offsets + (pid * BLOCK_SIZE)
-    state_norm = state_norm + tl.rand(seeds.to(tl.uint32), offsets)
+    state_norm = state_norm + tl.rand(seed, offsets)
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
@@ -114,6 +137,18 @@ def fused_update_exp_avg_sq_kernel(
     tl.store(min_ptr + pid, chunk_min)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {},  # block_size can't be tuned since it's tied to quantization method
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
+    ],
+    key=["n_elements"],
+)
 @triton.jit
 def fused_update_exp_avg_kernel(
     update_ptr,  # fp32
@@ -155,14 +190,13 @@ def fused_update_exp_avg_kernel(
     chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
     chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
 
-    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-10)
+    scale = tl.maximum((chunk_max - chunk_min) / 255.0, 1e-30)
 
     # Normalize
     state_norm = (state_fp32 - chunk_min) / scale
 
     # Stochastic Rounding
-    seeds = seed + offsets + (pid * BLOCK_SIZE)
-    state_norm = state_norm + tl.rand(seeds.to(tl.uint32), offsets)
+    state_norm = state_norm + tl.rand(seed, offsets)
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
@@ -171,10 +205,9 @@ def fused_update_exp_avg_kernel(
     # Store State (uint8)
     tl.store(exp_avg_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
 
-    # Store Metadata (only first thread in block writes)
-    if tl.program_id(axis=0) == pid:
-        tl.store(scale_ptr + pid, scale)
-        tl.store(min_ptr + pid, chunk_min)
+    # Store Metadata
+    tl.store(scale_ptr + pid, scale)
+    tl.store(min_ptr + pid, chunk_min)
 
 
 def add_stochastic_triton(A_bf16, B, alpha=1.0):
@@ -203,7 +236,6 @@ def add_stochastic_triton(A_bf16, B, alpha=1.0):
             float(alpha),
             seed,
             n_elements,
-            BLOCK_SIZE=1024,  # TODO: tune
         )
 
         return A_bf16.view(shape)
