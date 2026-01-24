@@ -53,6 +53,7 @@ def fused_update_exp_avg_sq_kernel(
     scale_ptr,  # fp32
     min_ptr,  # fp32
     beta,  # float
+    eps,  # float
     seed,  # int
     n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
@@ -73,14 +74,14 @@ def fused_update_exp_avg_sq_kernel(
     # Dequantize
     state_fp32 = (state_fp32 * old_scale) + old_min
 
-    # Load update
-    update_sq_val = tl.load(update_sq_ptr + offsets, mask=mask, other=0.0)
+    # Load grad
+    grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+
+    # update = (grad**2) + group["eps"][0]
+    update_sq_val = (grad_val * grad_val) + eps
 
     # Update EMA: exp_avg_sq.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_sq_val * (1.0 - beta))
-
-    # Load grad
-    grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0)
 
     # update = exp_avg_sq.rsqrt().mul_(grad)
     output_val = tl.rsqrt(state_fp32) * grad_val
@@ -209,27 +210,14 @@ def add_stochastic_triton(A_bf16, B, alpha=1.0):
 
 def fused_update_exp_avg_sq_triton(
     grad,
-    update_sq,
     exp_avg_sq_u8,
     quant_state,
     beta,
+    eps,
 ):
-    """
-    Fuses: Dequantize -> EMA Update -> Compute Output -> Quantize
-
-    `update_sq` is modified in-place
-
-    Should be ~2-4x faster, and use ~0.5x peak memory usage
-    """
-
-    assert update_sq.dtype == torch.float32, (
-        "update_sq must be float32 as it will be stored as float32"
-    )
-    assert update_sq.is_contiguous(), (
-        "update_sq must be contiguous as it is modified in-place"
-    )
-
     n_elements = grad.numel()
+
+    update_sq = torch.empty_like(grad, dtype=torch.float32)
 
     # Flatten views for kernel
     grad_flat = grad.view(-1)
@@ -254,10 +242,13 @@ def fused_update_exp_avg_sq_triton(
         scales,
         mins,
         float(beta),
+        float(eps),
         seed,
         n_elements,
         BLOCK_SIZE=block_size,
     )
+
+    return update_sq
 
 
 def fused_update_exp_avg_triton(
@@ -500,8 +491,9 @@ class CAME(Optimizer):
 
         state["step"] += 1
 
-        update = (grad**2) + group["eps"][0]
         if factored:
+            update = (grad**2) + group["eps"][0]
+
             exp_avg_sq_row = state["exp_avg_sq_row"]
             exp_avg_sq_col = state["exp_avg_sq_col"]
 
@@ -518,16 +510,16 @@ class CAME(Optimizer):
         else:
             # non-factored: update second moment
             if use_quantization:
-                # update is modified in-place
-                # update must be fp32 and contiguous
-                fused_update_exp_avg_sq_triton(
+                # update = (grad**2) + group["eps"][0] is created within the kernel
+                update = fused_update_exp_avg_sq_triton(
                     grad=grad,
-                    update_sq=update,
                     exp_avg_sq_u8=state["exp_avg_sq"],
                     quant_state=state["exp_avg_sq_quant_state"],
                     beta=group["betas"][1],
+                    eps=group["eps"][0],
                 )
             else:
+                update = (grad**2) + group["eps"][0]
                 exp_avg_sq = state["exp_avg_sq"]
                 exp_avg_sq.mul_(group["betas"][1]).add_(
                     update, alpha=1.0 - group["betas"][1]
