@@ -12,6 +12,8 @@ def add_stochastic_kernel(
     a_ptr,  # bf16
     b_ptr,  # fp32
     alpha,  # float
+    weight_decay,  # float
+    enable_cautious_weight_decay: tl.constexpr,  # bool
     seed,  # int
     n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
@@ -21,11 +23,16 @@ def add_stochastic_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load A and cast from bf16 to fp32 (adds 16 empty bits to the mantissa)
+    # Load A (p.data) and cast from bf16 to fp32 (adds 16 empty bits to the mantissa)
     A_fp32 = tl.load(a_ptr + offsets, mask=mask).cast(tl.float32)
 
-    # Load B
+    # Load B (update)
     B_fp32 = tl.load(b_ptr + offsets, mask=mask)
+
+    if enable_cautious_weight_decay:  # TODO: include confidence_factor?
+        B_fp32 = B_fp32 + (A_fp32 * (B_fp32 * A_fp32 >= 0)) * weight_decay
+    else:
+        B_fp32 = B_fp32 + (A_fp32 * weight_decay)
 
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
@@ -122,6 +129,7 @@ def fused_update_exp_avg_kernel(
     min_ptr,  # fp32
     output_ptr,  # fp32
     beta,  # float
+    rms_clip_scale,  # float
     seed,  # int
     n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
@@ -144,6 +152,9 @@ def fused_update_exp_avg_kernel(
 
     # Load update
     update_val = tl.load(update_ptr + offsets, mask=mask, other=0.0)
+
+    # Apply RMS clipping scale
+    update_val = update_val * rms_clip_scale
 
     # Update EMA: exp_avg.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_val * (1.0 - beta))
@@ -176,7 +187,13 @@ def fused_update_exp_avg_kernel(
     tl.store(min_ptr + pid, chunk_min)
 
 
-def add_stochastic_triton(A_bf16, B, alpha=1.0):
+def add_stochastic_triton(
+    A_bf16,
+    B,
+    alpha=1.0,
+    weight_decay=0.0,
+    enable_cautious_weight_decay=False,
+):
     n_elements = A_bf16.numel()
     if n_elements == 0:
         return A_bf16
@@ -200,6 +217,8 @@ def add_stochastic_triton(A_bf16, B, alpha=1.0):
             A_bf16,
             B,
             float(alpha),
+            float(weight_decay),
+            bool(enable_cautious_weight_decay),
             seed,
             n_elements,
             BLOCK_SIZE=1024,  # TODO: tune
@@ -256,12 +275,8 @@ def fused_update_exp_avg_triton(
     exp_avg_u8,
     quant_state,
     beta,
+    rms_clip_scale,
 ):
-    """
-    Fuses: Dequantize -> EMA Update -> Quantize
-
-    Returns: The updated exp_avg (float32) for subsequent instability calculation
-    """
     n_elements = update.numel()
 
     assert update.dtype == torch.float32
@@ -292,6 +307,7 @@ def fused_update_exp_avg_triton(
         mins,
         output_flat,
         float(beta),
+        float(rms_clip_scale),
         seed,
         n_elements,
         BLOCK_SIZE=block_size,
@@ -334,8 +350,8 @@ class CAME(Optimizer):
             conflicts with the gradient, boosting only aligned directions (default: False)
         enable_cautious_weight_decay (bool, optional): only apply weight decay when the parameter
             and the update have the same sign (default: False)
-        enable_8bit (bool, optional): enable 8-bit quantization for large layers (default: False)
-        block_size (int, optional): quantization block size for 8-bit (default: 2048)
+        enable_8bit (bool, optional): enable fused 8-bit quantization for large layers (default: False)
+        block_size (int, optional): quantization block size for 8-bit (default: 256)
         min_quant_size (int, optional): minimum number of parameters to use quantization (default: 16384)
     """
 
@@ -426,25 +442,25 @@ class CAME(Optimizer):
             return
 
         grad = p.grad.data
-        if grad.dtype in {torch.float16, torch.bfloat16}:
+        if grad.dtype in {torch.float16, torch.bfloat16}:  # TODO: keep in original dtype until float is needed?
             grad = grad.float()
         if grad.is_sparse:
             raise RuntimeError("CAME does not support sparse gradients.")
 
         state = self.state[p]
         grad_shape = grad.shape
+        grad_numel = grad.numel()
 
         factored = len(grad_shape) >= 2
-        use_quantization = group["enable_8bit"] and grad.numel() > group["min_quant_size"]
+        use_quantization = group["enable_8bit"] and grad_numel > group["min_quant_size"]
 
         # State Initialization
         if len(state) == 0:
             state["step"] = 0
             # initialize first moment with optional quantization
             if use_quantization:
-                n_elements = grad.numel()
                 block_size = group["block_size"]
-                num_blocks = (n_elements + block_size - 1) // block_size
+                num_blocks = (grad_numel + block_size - 1) // block_size
 
                 state["exp_avg"] = torch.zeros_like(grad, dtype=torch.uint8)
                 state["exp_avg_quant_state"] = {
@@ -471,9 +487,8 @@ class CAME(Optimizer):
                 ).type_as(grad)
             else:
                 if use_quantization:
-                    n_elements = grad.numel()
                     block_size = group["block_size"]
-                    num_blocks = (n_elements + block_size - 1) // block_size
+                    num_blocks = (grad_numel + block_size - 1) // block_size
 
                     state["exp_avg_sq"] = torch.zeros_like(grad, dtype=torch.uint8)
                     state["exp_avg_sq_quant_state"] = {
@@ -527,34 +542,34 @@ class CAME(Optimizer):
                 update = exp_avg_sq.rsqrt().mul_(grad)
                 state["exp_avg_sq"] = exp_avg_sq
 
-        update.div_(
-            (
-                (update.norm(2) / (update.numel() ** 0.5)) / group["clip_threshold"]
-            ).clamp_(min=1.0)
-        )
-
         # update first moment
         if use_quantization:
+            rms_clip_scale = 1.0 / (update.norm(2) / (update.numel() ** 0.5) / group["clip_threshold"]).clamp(min=1.0)
             exp_avg = fused_update_exp_avg_triton(
                 update=update,
                 exp_avg_u8=state["exp_avg"],
                 quant_state=state["exp_avg_quant_state"],
                 beta=group["betas"][0],
+                rms_clip_scale=rms_clip_scale,
             )
         else:
+            update.div_(
+                (
+                    (update.norm(2) / (update.numel() ** 0.5)) / group["clip_threshold"]
+                ).clamp_(min=1.0)
+            )
             exp_avg = state["exp_avg"]
             exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
 
-        masked_exp_avg = exp_avg
         if group["enable_cautious_update"]:
-            mask = (masked_exp_avg * grad > 0).to(grad.dtype)
+            mask = (exp_avg * grad > 0).to(grad.dtype)
             mask.div_(mask.mean().clamp_(min=1e-3))
-            masked_exp_avg = masked_exp_avg * mask
+            exp_avg.mul_(mask)
 
         if factored:
             # Confidence-guided strategy
             # Calculation of instability
-            res = (update - masked_exp_avg) ** 2 + group["eps"][1]
+            res = (update - exp_avg) ** 2 + group["eps"][1]
 
             exp_avg_res_row = state["exp_avg_res_row"]
             exp_avg_res_col = state["exp_avg_res_col"]
@@ -568,30 +583,29 @@ class CAME(Optimizer):
 
             # Approximation of exponential moving average of instability
             res_approx = _approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
-            confidence_factor = res_approx
-            update = res_approx.mul_(masked_exp_avg)
+            update = res_approx.mul_(exp_avg)
         else:
-            update = masked_exp_avg.clone()
+            update = exp_avg.clone()
 
         if not use_quantization:
             state["exp_avg"] = exp_avg
 
-        if group["weight_decay"] != 0:
-            decay_src = p.data
-            if group["enable_cautious_weight_decay"]:
-                mask = (update * p.data >= 0)
-                decay_src = decay_src * mask
-                if factored:
-                    decay_src.mul_(confidence_factor)
-
-            update.add_(decay_src, alpha=group["weight_decay"])
-
-        if p.dtype == torch.bfloat16 and group["enable_stochastic_rounding"]:
+        if group["weight_decay"] != 0.0 and group["enable_stochastic_rounding"] and p.dtype == torch.bfloat16:
             add_stochastic_triton(
                 A_bf16=p.data,
                 B=update,
                 alpha=-group["lr"],
+                weight_decay=group["weight_decay"],
+                enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
             )
+        elif group["weight_decay"] != 0.0:
+            decay_src = p.data
+            if group["enable_cautious_weight_decay"]:
+                mask = (update * p.data >= 0)
+                decay_src = decay_src * mask
+
+            update.add_(decay_src, alpha=group["weight_decay"])
+            p.data.add_(update, alpha=-group["lr"])
         else:
             p.data.add_(update, alpha=-group["lr"])
 
