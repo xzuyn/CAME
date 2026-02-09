@@ -9,17 +9,19 @@ import random
 # Reference: https://github.com/Nerogar/OneTrainer/blob/062443014f380637a2bf8ddaeb2ff9259599ecab/modules/util/bf16_stochastic_rounding.py#L12C1-L57C36
 @triton.jit
 def add_stochastic_kernel(
-    a_ptr,  # bf16
+    a_ptr,  # bf16 or fp32
     b_ptr,  # fp32
     alpha,  # float
+    bias_correction,  # float
     weight_decay,  # float
     enable_cautious_weight_decay: tl.constexpr,  # bool
+    enable_stochastic_rounding: tl.constexpr,  # bool
     seed,  # int
     n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
+    block_start = pid.to(tl.int64) * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
@@ -27,7 +29,7 @@ def add_stochastic_kernel(
     A_fp32 = tl.load(a_ptr + offsets, mask=mask).cast(tl.float32)
 
     # Load B (update)
-    B_fp32 = tl.load(b_ptr + offsets, mask=mask)
+    B_fp32 = tl.load(b_ptr + offsets, mask=mask) / bias_correction
 
     if enable_cautious_weight_decay:  # TODO: include confidence_factor?
         B_fp32 = B_fp32 + (A_fp32 * (B_fp32 * A_fp32 >= 0)) * weight_decay
@@ -37,19 +39,21 @@ def add_stochastic_kernel(
     # A + (alpha * B)
     A_fp32 = A_fp32 + (alpha * B_fp32)
 
-    # stochastic rounding to nearest bf16 decimal
-    # bitcast A from fp32 to u32 so we can do bit manipulation
-    A_u32 = A_fp32.cast(tl.uint32, bitcast=True)
-    # create u32 random noise, mask off its upper 16 bits, and add into A
-    A_u32 = A_u32 + tl.randint(seed, offsets) & 0xFFFF
-    # mask off the lower 16 bits of A
-    A_u32 = A_u32 & 0xFFFF0000
-    # bitcast the masked A from u32 to fp32
-    A_fp32 = A_u32.cast(tl.float32, bitcast=True)
-    # cast A from fp32 to bf16 (drop the extra 16 bits in the mantissa)
-    A_bf16 = A_fp32.cast(tl.bfloat16)
-
-    tl.store(a_ptr + offsets, A_bf16, mask=mask)
+    if enable_stochastic_rounding:
+        # stochastic rounding to nearest bf16 decimal
+        # bitcast A from fp32 to u32 so we can do bit manipulation
+        A_u32 = A_fp32.cast(tl.uint32, bitcast=True)
+        # create u32 random noise, mask off its upper 16 bits, and add into A
+        A_u32 = A_u32 + tl.randint(seed, offsets) & 0xFFFF
+        # mask off the lower 16 bits of A
+        A_u32 = A_u32 & 0xFFFF0000
+        # bitcast the masked A from u32 to fp32
+        A_fp32 = A_u32.cast(tl.float32, bitcast=True)
+        # cast A from fp32 to bf16 (drop the extra 16 bits in the mantissa)
+        A_bf16 = A_fp32.cast(tl.bfloat16)
+        tl.store(a_ptr + offsets, A_bf16, mask=mask)
+    else:
+        tl.store(a_ptr + offsets, A_fp32, mask=mask)
 
 
 @triton.jit
@@ -61,13 +65,14 @@ def fused_update_exp_avg_sq_kernel(
     min_ptr,  # fp32
     beta,  # float
     eps,  # float
+    bias_correction,  # float
     seed,  # int
     n_elements,  # int
     BLOCK_SIZE: tl.constexpr,
 ):
     # Each thread block processes exactly one quantization block
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
+    block_start = pid.to(tl.int64) * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
@@ -90,15 +95,15 @@ def fused_update_exp_avg_sq_kernel(
     # Update EMA: exp_avg_sq.mul_(beta).add_(update, alpha=1-beta)
     state_fp32 = (state_fp32 * beta) + (update_sq_val * (1.0 - beta))
 
-    # update = exp_avg_sq.rsqrt().mul_(grad)
-    output_val = tl.rsqrt(state_fp32) * grad_val
+    # update = exp_avg_sq.rsqrt().mul_(grad) with bias correction
+    output_val = tl.rsqrt(state_fp32 / bias_correction) * grad_val
 
     # Store update
     tl.store(update_sq_ptr + offsets, output_val, mask=mask)
 
     # Calculate new min/max for this quantization block
-    chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
-    chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
+    chunk_min = tl.min(tl.where(mask, state_fp32, 1e30), axis=0)
+    chunk_max = tl.max(tl.where(mask, state_fp32, -1e30), axis=0)
 
     scale = (chunk_max - chunk_min) / 255.0
     is_scale_zero = scale == 0.0
@@ -136,7 +141,7 @@ def fused_update_exp_avg_kernel(
 ):
     # Each thread block processes exactly one quantization block
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
+    block_start = pid.to(tl.int64) * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
@@ -163,8 +168,8 @@ def fused_update_exp_avg_kernel(
     tl.store(output_ptr + offsets, state_fp32, mask=mask)
 
     # Calculate new min/max for this quantization block
-    chunk_min = tl.min(tl.where(mask, state_fp32, float("inf")), axis=0)
-    chunk_max = tl.max(tl.where(mask, state_fp32, float("-inf")), axis=0)
+    chunk_min = tl.min(tl.where(mask, state_fp32, 1e30), axis=0)
+    chunk_max = tl.max(tl.where(mask, state_fp32, -1e30), axis=0)
 
     scale = (chunk_max - chunk_min) / 255.0
     is_scale_zero = scale == 0.0
@@ -187,44 +192,45 @@ def fused_update_exp_avg_kernel(
     tl.store(min_ptr + pid, chunk_min)
 
 
-def add_stochastic_triton(
-    A_bf16,
+def apply_update_triton(
+    A,
     B,
     alpha=1.0,
+    bias_correction=1.0,
     weight_decay=0.0,
     enable_cautious_weight_decay=False,
+    enable_stochastic_rounding=False,
 ):
-    n_elements = A_bf16.numel()
+    n_elements = A.numel()
     if n_elements == 0:
-        return A_bf16
-
-    assert A_bf16.shape == B.shape
-    assert A_bf16.dtype == torch.bfloat16
-    assert A_bf16.is_contiguous()
+        return A
 
     with torch.no_grad():
         B = B.contiguous()
-
-        shape = A_bf16.shape
-
-        A_bf16 = A_bf16.view(-1)
-        B = B.view(-1)
+        shape = A.shape
+        A_flat = A.view(-1)
+        B_flat = B.view(-1)
 
         seed = random.randint(0, 2**32 - 1)
-
         grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
+
+        do_sr = enable_stochastic_rounding and A.dtype == torch.bfloat16
+
         add_stochastic_kernel[grid](
-            A_bf16,
-            B,
+            A_flat,
+            B_flat,
             float(alpha),
+            float(bias_correction),
             float(weight_decay),
             bool(enable_cautious_weight_decay),
+            bool(do_sr),
             seed,
             n_elements,
             BLOCK_SIZE=1024,  # TODO: tune
+            num_warps=8  # TODO: leave at default?
         )
 
-        return A_bf16.view(shape)
+        return A_flat.view(shape)
 
 
 def fused_update_exp_avg_sq_triton(
@@ -233,6 +239,7 @@ def fused_update_exp_avg_sq_triton(
     quant_state,
     beta,
     eps,
+    bias_correction,
 ):
     n_elements = grad.numel()
 
@@ -262,6 +269,7 @@ def fused_update_exp_avg_sq_triton(
         mins,
         float(beta),
         float(eps),
+        float(bias_correction),
         seed,
         n_elements,
         BLOCK_SIZE=block_size,
@@ -330,11 +338,11 @@ class CAME(Optimizer):
 
     This implementation is based on:
       - CAME: Confidence-guided Adaptive Memory Efficient Optimization (https://arxiv.org/abs/2307.02047)
-      - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192) - Translated to Triton
+      - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192)
       - Cautious Optimizers: Improving Training with One Line of Code (https://arxiv.org/abs/2411.16085)
       - Cautious Weight Decay (https://arxiv.org/abs/2510.12402)
       - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer
-        (https://arxiv.org/abs/2501.18427) - Translated to Triton
+        (https://arxiv.org/abs/2501.18427)
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups
@@ -390,26 +398,12 @@ class CAME(Optimizer):
         )
         super(CAME, self).__init__(params, defaults)
 
-        if not all(
-            user_option is False
-            for user_option in [
-                enable_stochastic_rounding,
-                enable_cautious_update,
-                enable_cautious_weight_decay,
-                enable_8bit,
-            ]
-        ):
+        if any([enable_stochastic_rounding, enable_cautious_update, enable_cautious_weight_decay, enable_8bit]):
             print("\n==== CAME Modifications ====")
-            if enable_stochastic_rounding:
-                print(f"- Stochastic Rounding enabled.")
-            if enable_cautious_update:
-                print("- Cautious Update enabled.")
-            if enable_cautious_weight_decay:
-                print("- Cautious Weight Decay enabled.")
-            if enable_8bit:
-                print(
-                    f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}."
-                )
+            if enable_stochastic_rounding: print(f"- Stochastic Rounding enabled.")
+            if enable_cautious_update: print("- Cautious Update enabled.")
+            if enable_cautious_weight_decay: print("- Cautious Weight Decay enabled.")
+            if enable_8bit: print(f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}.")
             print("==== CAME Modifications ====\n")
 
     @property
@@ -452,7 +446,7 @@ class CAME(Optimizer):
         grad_numel = grad.numel()
 
         factored = len(grad_shape) >= 2
-        use_quantization = group["enable_8bit"] and grad_numel > group["min_quant_size"]
+        use_quantization = group["enable_8bit"] and grad_numel > group["min_quant_size"]  # TODO: add triton non_quant
 
         # State Initialization
         if len(state) == 0:
@@ -505,6 +499,10 @@ class CAME(Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(grad)
 
         state["step"] += 1
+        beta1, beta2, beta3 = group["betas"]
+        bias_correction1 = 1.0 - beta1 ** state["step"]  # used for first moment  # TODO: make bias correction optional?
+        bias_correction2 = 1.0 - beta2 ** state["step"]  # used for second moment
+        bias_correction3 = 1.0 - beta3 ** state["step"]  # used for instability/confidence
 
         if factored:
             update = (grad**2) + group["eps"][0]
@@ -512,15 +510,18 @@ class CAME(Optimizer):
             exp_avg_sq_row = state["exp_avg_sq_row"]
             exp_avg_sq_col = state["exp_avg_sq_col"]
 
-            exp_avg_sq_row.mul_(group["betas"][1]).add_(
-                update.mean(dim=-1), alpha=1.0 - group["betas"][1]
+            exp_avg_sq_row.mul_(beta2).add_(
+                update.mean(dim=-1), alpha=1.0 - beta2
             )
-            exp_avg_sq_col.mul_(group["betas"][1]).add_(
-                update.mean(dim=-2), alpha=1.0 - group["betas"][1]
+            exp_avg_sq_col.mul_(beta2).add_(
+                update.mean(dim=-2), alpha=1.0 - beta2
             )
 
             # Approximation of exponential moving average of square of gradient
-            update = _approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+            update = _approx_sq_grad(
+                exp_avg_sq_row / bias_correction2,
+                exp_avg_sq_col / bias_correction2
+            )
             update.mul_(grad)
         else:
             # non-factored: update second moment
@@ -530,17 +531,16 @@ class CAME(Optimizer):
                     grad=grad,
                     exp_avg_sq_u8=state["exp_avg_sq"],
                     quant_state=state["exp_avg_sq_quant_state"],
-                    beta=group["betas"][1],
+                    beta=beta2,
                     eps=group["eps"][0],
+                    bias_correction=bias_correction2,
                 )
             else:
                 update = (grad**2) + group["eps"][0]
-                exp_avg_sq = state["exp_avg_sq"]
-                exp_avg_sq.mul_(group["betas"][1]).add_(
-                    update, alpha=1.0 - group["betas"][1]
+                state["exp_avg_sq"].mul_(beta2).add_(
+                    update, alpha=1.0 - beta2
                 )
-                update = exp_avg_sq.rsqrt().mul_(grad)
-                state["exp_avg_sq"] = exp_avg_sq
+                update = state["exp_avg_sq"].div(bias_correction2).rsqrt().mul_(grad)
 
         # update first moment
         if use_quantization:
@@ -549,7 +549,7 @@ class CAME(Optimizer):
                 update=update,
                 exp_avg_u8=state["exp_avg"],
                 quant_state=state["exp_avg_quant_state"],
-                beta=group["betas"][0],
+                beta=beta1,
                 rms_clip_scale=rms_clip_scale,
             )
         else:
@@ -559,7 +559,7 @@ class CAME(Optimizer):
                 ).clamp_(min=1.0)
             )
             exp_avg = state["exp_avg"]
-            exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
+            exp_avg.mul_(beta1).add_(update, alpha=1 - beta1)
 
         if group["enable_cautious_update"]:
             mask = (exp_avg * grad > 0).to(grad.dtype)
@@ -571,43 +571,32 @@ class CAME(Optimizer):
             # Calculation of instability
             res = (update - exp_avg) ** 2 + group["eps"][1]
 
-            exp_avg_res_row = state["exp_avg_res_row"]
-            exp_avg_res_col = state["exp_avg_res_col"]
-
-            exp_avg_res_row.mul_(group["betas"][2]).add_(
-                res.mean(dim=-1), alpha=1.0 - group["betas"][2]
+            state["exp_avg_res_row"].mul_(beta3).add_(
+                res.mean(dim=-1), alpha=1.0 - beta3
             )
-            exp_avg_res_col.mul_(group["betas"][2]).add_(
-                res.mean(dim=-2), alpha=1.0 - group["betas"][2]
+            state["exp_avg_res_col"].mul_(beta3).add_(
+                res.mean(dim=-2), alpha=1.0 - beta3
             )
 
             # Approximation of exponential moving average of instability
-            res_approx = _approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
+            res_approx = _approx_sq_grad(
+                state["exp_avg_res_row"] / bias_correction3,
+                state["exp_avg_res_col"] / bias_correction3
+            )
             update = res_approx.mul_(exp_avg)
-        else:
-            update = exp_avg.clone()
 
         if not use_quantization:
             state["exp_avg"] = exp_avg
 
-        if group["weight_decay"] != 0.0 and group["enable_stochastic_rounding"] and p.dtype == torch.bfloat16:
-            add_stochastic_triton(
-                A_bf16=p.data,
-                B=update,
-                alpha=-group["lr"],
-                weight_decay=group["weight_decay"],
-                enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
-            )
-        elif group["weight_decay"] != 0.0:
-            decay_src = p.data
-            if group["enable_cautious_weight_decay"]:
-                mask = (update * p.data >= 0)
-                decay_src = decay_src * mask
-
-            update.add_(decay_src, alpha=group["weight_decay"])
-            p.data.add_(update, alpha=-group["lr"])
-        else:
-            p.data.add_(update, alpha=-group["lr"])
+        apply_update_triton(
+            A=p.data,
+            B=update,
+            alpha=-group["lr"],
+            bias_correction=bias_correction1,
+            weight_decay=group["weight_decay"],
+            enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
+            enable_stochastic_rounding=group["enable_stochastic_rounding"],
+        )
 
     @torch.inference_mode()
     def step(self, closure=None):
