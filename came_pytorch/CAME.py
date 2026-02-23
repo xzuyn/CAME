@@ -4,6 +4,7 @@ from torch.optim import Optimizer
 import triton
 import triton.language as tl
 import random
+import math
 
 
 # Reference: https://github.com/Nerogar/OneTrainer/blob/062443014f380637a2bf8ddaeb2ff9259599ecab/modules/util/bf16_stochastic_rounding.py#L12C1-L57C36
@@ -341,8 +342,9 @@ class CAME(Optimizer):
       - Revisiting BFloat16 Training (https://arxiv.org/abs/2010.06192)
       - Cautious Optimizers: Improving Training with One Line of Code (https://arxiv.org/abs/2411.16085)
       - Cautious Weight Decay (https://arxiv.org/abs/2510.12402)
-      - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer
-        (https://arxiv.org/abs/2501.18427)
+      - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer (https://arxiv.org/abs/2501.18427)
+      - OrthoGrad Improves Neural Calibration (https://www.arxiv.org/abs/2506.04487)
+      - Prodigy: An Expeditiously Adaptive Parameter-Free Learner (https://arxiv.org/abs/2306.06101)
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups
@@ -361,6 +363,12 @@ class CAME(Optimizer):
         enable_8bit (bool, optional): enable fused 8-bit quantization for large layers (default: False)
         block_size (int, optional): quantization block size for 8-bit (default: 256)
         min_quant_size (int, optional): minimum number of parameters to use quantization (default: 16384)
+        enable_orthograd (bool, optional): project gradients orthogonally to the weights to prevent
+            magnitude inflation (default: False)
+        enable_prodigy (bool, optional): automatically estimate and scale the learning rate using
+            the Prodigy method; effective lr becomes lr * d at each step (default: False)
+        d0 (float, optional): initial lower-bound estimate of the distance to solution D;
+            only used when enable_prodigy=True (default: 1e-6)
     """
 
     def __init__(
@@ -377,10 +385,17 @@ class CAME(Optimizer):
         enable_8bit=False,
         block_size=256,
         min_quant_size=16384,
+        enable_orthograd=False,
+        enable_prodigy=False,
+        d0=1e-6,
     ):
         self.torch_gc()
 
-        assert lr > 0.0
+        if enable_prodigy and lr is None:
+            lr = 1.0
+
+        assert lr is not None and lr > 0.0
+        assert d0 > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
 
         defaults = dict(
@@ -395,15 +410,24 @@ class CAME(Optimizer):
             enable_8bit=enable_8bit,
             block_size=block_size,
             min_quant_size=min_quant_size,
+            enable_orthograd=enable_orthograd,
+            enable_prodigy=enable_prodigy,
+            d0=d0,
         )
         super(CAME, self).__init__(params, defaults)
 
-        if any([enable_stochastic_rounding, enable_cautious_update, enable_cautious_weight_decay, enable_8bit]):
+        features = [
+            enable_stochastic_rounding, enable_cautious_update,
+            enable_cautious_weight_decay, enable_8bit, enable_orthograd, enable_prodigy,
+        ]
+        if any(features):
             print("\n==== CAME Modifications ====")
             if enable_stochastic_rounding: print(f"- Stochastic Rounding enabled.")
             if enable_cautious_update: print("- Cautious Update enabled.")
             if enable_cautious_weight_decay: print("- Cautious Weight Decay enabled.")
             if enable_8bit: print(f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}.")
+            if enable_orthograd: print("- Orthogonal Gradient enabled.")
+            if enable_prodigy: print(f"- Prodigy enabled: d0={d0}.")
             print("==== CAME Modifications ====\n")
 
     @property
@@ -430,6 +454,82 @@ class CAME(Optimizer):
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
 
+    @staticmethod
+    def apply_orthograd_(p, grad):
+        eps = torch.finfo(grad.dtype).eps
+
+        # Flatten views for operations on R^p
+        theta = p.data.view(-1)
+        g = grad.view(-1)
+
+        # Capture ||∇L(θ)||
+        grad_norm = g.norm(2)
+
+        # g = ∇L(θ) - (<∇L(θ), θ> / ||θ||^2) * θ
+        theta_sq_norm = torch.dot(theta, theta)
+
+        if theta_sq_norm > eps:
+            proj_factor = torch.dot(g, theta) / theta_sq_norm
+            g.sub_(theta, alpha=proj_factor)
+
+        # g_hat = (||∇L(θ)|| / (||g|| + ε)) * g
+        g_orth_norm = g.norm(2)
+        renorm_scale = grad_norm / (g_orth_norm + eps)
+        g.mul_(renorm_scale)
+
+        return grad
+
+    def _prodigy_update_d(self, group):
+        beta2 = group["betas"][1]
+        beta2_sqrt = math.sqrt(beta2)
+        d = group["prodigy_d"]
+        gamma = group["lr"]
+
+        # Scale common to all parameter contributions this step
+        d2_gamma = d * d * gamma
+
+        # Decay the group-level r scalar
+        r = beta2_sqrt * group["prodigy_r"]
+
+        # Accumulate contributions from every parameter
+        s_l1_total = 0.0
+        alpha_s = (1.0 - beta2_sqrt) * d2_gamma
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            state = self.state[p]
+            if "prodigy_s" not in state:
+                # s has the same shape as the parameter; kept in fp32
+                state["prodigy_s"] = torch.zeros_like(p.data, dtype=torch.float32)
+                # x0: snapshot of the parameter at step 0, used to compute x0 - x_k
+                # store in fp32 regardless of param dtype
+                state["prodigy_x0"] = p.data.detach().float().clone()
+
+            grad = p.grad.data.float()
+            x0 = state["prodigy_x0"]
+            s = state["prodigy_s"]
+
+            # r accumulation: scalar inner product summed across the parameter tensor
+            # <g, x0 - x>  (all in fp32)
+            x_fp32 = p.data.float()
+            inner = torch.dot(grad.view(-1), (x0 - x_fp32).view(-1)).item()
+            r += alpha_s * inner
+
+            # s update (in-place): s = sqrt(β2)·s + (1-sqrt(β2))·γ·d²·g
+            s.mul_(beta2_sqrt).add_(grad, alpha=alpha_s)
+
+            s_l1_total += s.abs().sum().item()
+
+        # Update group-level r
+        group["prodigy_r"] = r
+
+        # Update d estimate only when evidence is positive
+        if s_l1_total > 0.0 and r > 0.0:
+            d_hat = r / s_l1_total
+            group["prodigy_d"] = max(d, d_hat)
+
     @torch.inference_mode()
     def step_param(self, p, group):
         if p.grad is None:
@@ -441,6 +541,9 @@ class CAME(Optimizer):
         if grad.is_sparse:
             raise RuntimeError("CAME does not support sparse gradients.")
 
+        if group["enable_orthograd"]:
+            self.apply_orthograd_(p, grad)
+
         state = self.state[p]
         grad_shape = grad.shape
         grad_numel = grad.numel()
@@ -449,7 +552,7 @@ class CAME(Optimizer):
         use_quantization = group["enable_8bit"] and grad_numel > group["min_quant_size"]  # TODO: add triton non_quant
 
         # State Initialization
-        if len(state) == 0:
+        if "step" not in state:
             state["step"] = 0
             # initialize first moment with optional quantization
             if use_quantization:
@@ -590,10 +693,15 @@ class CAME(Optimizer):
         if not use_quantization:
             state["exp_avg"] = exp_avg
 
+        if group["enable_prodigy"]:
+            effective_lr = group["lr"] * group["prodigy_d"]
+        else:
+            effective_lr = group["lr"]
+
         apply_update_triton(
             A=p.data,
             B=update,
-            alpha=-group["lr"],
+            alpha=-effective_lr,
             bias_correction=bias_correction1,
             weight_decay=group["weight_decay"],
             enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
@@ -610,6 +718,13 @@ class CAME(Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
+
+        for group in self.param_groups:
+            if group["enable_prodigy"]:
+                if "prodigy_d" not in group:
+                    group["prodigy_d"] = group["d0"]
+                    group["prodigy_r"] = 0.0
+                self._prodigy_update_d(group)
 
         for group in self.param_groups:
             for p in group["params"]:
