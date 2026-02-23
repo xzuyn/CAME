@@ -584,6 +584,8 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] / bias_correction3
             )
             update = res_approx.mul_(exp_avg)
+        else:
+            update = exp_avg
 
         if not use_quantization:
             state["exp_avg"] = exp_avg
