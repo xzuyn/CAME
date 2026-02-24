@@ -345,6 +345,7 @@ class CAME(Optimizer):
       - SANA 1.5: Efficient Scaling of Training-Time and Inference-Time Compute in Linear Diffusion Transformer (https://arxiv.org/abs/2501.18427)
       - OrthoGrad Improves Neural Calibration (https://www.arxiv.org/abs/2506.04487)
       - Prodigy: An Expeditiously Adaptive Parameter-Free Learner (https://arxiv.org/abs/2306.06101)
+      - The Road Less Scheduled (https://arxiv.org/abs/2405.15682)
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups
@@ -369,6 +370,8 @@ class CAME(Optimizer):
             the Prodigy method; effective lr becomes lr * d at each step (default: False)
         d0 (float, optional): initial lower-bound estimate of the distance to solution D;
             only used when enable_prodigy=True (default: 1e-6)
+        enable_schedule_free (bool, optional): enable Schedule-Free optimization to remove the need
+            for learning rate decay schedules (default: False)
     """
 
     def __init__(
@@ -388,6 +391,7 @@ class CAME(Optimizer):
         enable_orthograd=False,
         enable_prodigy=False,
         d0=1e-6,
+        enable_schedule_free=False,
     ):
         self.torch_gc()
 
@@ -413,12 +417,14 @@ class CAME(Optimizer):
             enable_orthograd=enable_orthograd,
             enable_prodigy=enable_prodigy,
             d0=d0,
+            enable_schedule_free=enable_schedule_free,
         )
         super(CAME, self).__init__(params, defaults)
 
         features = [
             enable_stochastic_rounding, enable_cautious_update,
-            enable_cautious_weight_decay, enable_8bit, enable_orthograd, enable_prodigy,
+            enable_cautious_weight_decay, enable_8bit, enable_orthograd,
+            enable_prodigy, enable_schedule_free,
         ]
         if any(features):
             print("\n==== CAME Modifications ====")
@@ -428,6 +434,7 @@ class CAME(Optimizer):
             if enable_8bit: print(f"- 8-bit enabled: block_size={block_size}, min_quant_size={min_quant_size}.")
             if enable_orthograd: print("- Orthogonal Gradient enabled.")
             if enable_prodigy: print(f"- Prodigy enabled: d0={d0}.")
+            if enable_schedule_free: print("- Schedule-Free enabled.")
             print("==== CAME Modifications ====\n")
 
     @property
@@ -501,26 +508,24 @@ class CAME(Optimizer):
 
             state = self.state[p]
             if "prodigy_s" not in state:
-                # s has the same shape as the parameter; kept in fp32
-                state["prodigy_s"] = torch.zeros_like(p.data, dtype=torch.float32)
-                # x0: snapshot of the parameter at step 0, used to compute x0 - x_k
-                # store in fp32 regardless of param dtype
-                state["prodigy_x0"] = p.data.detach().float().clone()
+                state["prodigy_s"] = torch.zeros_like(p.data, dtype=torch.bfloat16, device="cpu")
+                state["prodigy_x0"] = p.data.detach().bfloat16().cpu().clone()
 
             grad = p.grad.data.float()
-            x0 = state["prodigy_x0"]
-            s = state["prodigy_s"]
 
-            # r accumulation: scalar inner product summed across the parameter tensor
-            # <g, x0 - x>  (all in fp32)
+            # r accumulation: <g, x0 - x>  (all in fp32)
+            # x0 upcasted transiently and released immediately after .item()
+            x0_fp32 = state["prodigy_x0"].to(device=p.data.device, dtype=torch.float32)
             x_fp32 = p.data.float()
-            inner = torch.dot(grad.view(-1), (x0 - x_fp32).view(-1)).item()
+            inner = torch.dot(grad.view(-1), (x0_fp32 - x_fp32).view(-1)).item()
             r += alpha_s * inner
+            del x0_fp32
 
-            # s update (in-place): s = sqrt(β2)·s + (1-sqrt(β2))·γ·d²·g
-            s.mul_(beta2_sqrt).add_(grad, alpha=alpha_s)
-
-            s_l1_total += s.abs().sum().item()
+            # s update: upcast to fp32 on the parameter device, compute, store back as bf16 on CPU
+            s_fp32 = state["prodigy_s"].to(device=p.data.device, dtype=torch.float32)
+            s_fp32.mul_(beta2_sqrt).add_(grad, alpha=alpha_s)
+            s_l1_total += s_fp32.abs().sum().item()
+            state["prodigy_s"].copy_(s_fp32.bfloat16().cpu())
 
         # Update group-level r
         group["prodigy_r"] = r
@@ -529,6 +534,22 @@ class CAME(Optimizer):
         if s_l1_total > 0.0 and r > 0.0:
             d_hat = r / s_l1_total
             group["prodigy_d"] = max(d, d_hat)
+
+    def train(self, mode: bool = True):
+        for group in self.param_groups:
+            if not group.get("enable_schedule_free", False):
+                continue
+            for p in group["params"]:
+                state = self.state[p]
+                if "z" in state and "x" in state:
+                    if mode:
+                        beta1 = group["betas"][0]
+                        p.data.copy_(state["z"].lerp(state["x"], beta1))
+                    else:
+                        p.data.copy_(state["x"])
+
+    def eval(self):
+        self.train(False)
 
     @torch.inference_mode()
     def step_param(self, p, group):
@@ -698,15 +719,38 @@ class CAME(Optimizer):
         else:
             effective_lr = group["lr"]
 
-        apply_update_triton(
-            A=p.data,
-            B=update,
-            alpha=-effective_lr,
-            bias_correction=bias_correction1,
-            weight_decay=group["weight_decay"],
-            enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
-            enable_stochastic_rounding=group["enable_stochastic_rounding"],
-        )
+        if group["enable_schedule_free"]:
+            if "z" not in state:
+                state["z"] = p.data.clone()
+                state["x"] = p.data.clone()
+
+            # Apply CAME update to the z parameter (extrapolation point)
+            apply_update_triton(
+                A=state["z"],
+                B=update,
+                alpha=-effective_lr,
+                bias_correction=bias_correction1,
+                weight_decay=group["weight_decay"],
+                enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
+                enable_stochastic_rounding=group["enable_stochastic_rounding"],
+            )
+
+            # Update x (moving average point)
+            weight = 1.0 / state["step"]
+            state["x"].lerp_(state["z"], weight)
+
+            # Update p.data to y (lookahead point) for the next step's forward pass
+            p.data.copy_(state["z"].lerp(state["x"], beta1))
+        else:
+            apply_update_triton(
+                A=p.data,
+                B=update,
+                alpha=-effective_lr,
+                bias_correction=bias_correction1,
+                weight_decay=group["weight_decay"],
+                enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
+                enable_stochastic_rounding=group["enable_stochastic_rounding"],
+            )
 
     @torch.inference_mode()
     def step(self, closure=None):
