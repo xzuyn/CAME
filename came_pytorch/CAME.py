@@ -723,8 +723,16 @@ class CAME(Optimizer):
             if "z" not in state:
                 state["z"] = p.data.clone()
                 state["x"] = p.data.clone()
+                state["lr_sq_sum"] = 0.0
 
-            # Apply CAME update to the z parameter (extrapolation point)
+            lr_sq = effective_lr ** 2
+            state["lr_sq_sum"] += lr_sq
+
+            if state["lr_sq_sum"] > 0:
+                weight = lr_sq / state["lr_sq_sum"]
+            else:
+                weight = 1.0
+
             apply_update_triton(
                 A=state["z"],
                 B=update,
@@ -735,11 +743,8 @@ class CAME(Optimizer):
                 enable_stochastic_rounding=group["enable_stochastic_rounding"],
             )
 
-            # Update x (moving average point)
-            weight = 1.0 / state["step"]
             state["x"].lerp_(state["z"], weight)
 
-            # Update p.data to y (lookahead point) for the next step's forward pass
             p.data.copy_(state["z"].lerp(state["x"], beta1))
         else:
             apply_update_triton(
