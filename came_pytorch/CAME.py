@@ -62,8 +62,7 @@ def fused_update_exp_avg_sq_kernel(
     grad_ptr,  # fp32 or bf16
     update_sq_ptr,  # fp32
     exp_avg_sq_ptr,  # uint8
-    scale_ptr,  # fp32
-    min_ptr,  # fp32
+    scale_ptr,  # fp16 absmax of sqrt(state)
     beta,  # float
     eps,  # float
     bias_correction,  # float
@@ -77,15 +76,12 @@ def fused_update_exp_avg_sq_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load metadata (scalars per block)
-    old_scale = tl.load(scale_ptr + pid)
-    old_min = tl.load(min_ptr + pid)
+    # Load metadata
+    old_scale = tl.load(scale_ptr + pid).to(tl.float32)
 
-    # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    # Dequantize
-    state_fp32 = (state_fp32 * old_scale) + old_min
+    # Load quantized state and dequantize
+    state_u8 = tl.load(exp_avg_sq_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    state_fp32 = (state_u8 / 255.0 * old_scale) * (state_u8 / 255.0 * old_scale)
 
     # Load grad
     grad_val = tl.load(grad_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
@@ -102,18 +98,16 @@ def fused_update_exp_avg_sq_kernel(
     # Store update
     tl.store(update_sq_ptr + offsets, output_val, mask=mask)
 
-    # Calculate new min/max for this quantization block
-    chunk_min = tl.min(tl.where(mask, state_fp32, 1e30), axis=0)
-    chunk_max = tl.max(tl.where(mask, state_fp32, -1e30), axis=0)
-
-    scale = (chunk_max - chunk_min) / 255.0
-    is_scale_zero = scale == 0.0
+    # Quantize state
+    state_sqrt = tl.sqrt(state_fp32)
+    absmax = tl.max(tl.where(mask, state_sqrt, 0.0), axis=0)
+    is_absmax_zero = absmax == 0.0
 
     # Normalize
-    state_norm = (state_fp32 - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
+    state_norm = state_sqrt / tl.where(is_absmax_zero, 1.0, absmax)
 
     # Stochastic Rounding
-    state_norm = state_norm + tl.rand(seed, offsets)
+    state_norm = state_norm * 255.0 + tl.rand(seed, offsets)
     state_norm = tl.floor(state_norm)
 
     # Clamp to 0..255
@@ -123,16 +117,14 @@ def fused_update_exp_avg_sq_kernel(
     tl.store(exp_avg_sq_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
 
     # Store Metadata
-    tl.store(scale_ptr + pid, scale)
-    tl.store(min_ptr + pid, chunk_min)
+    tl.store(scale_ptr + pid, absmax.to(tl.float16))
 
 
 @triton.jit
 def fused_update_exp_avg_kernel(
     update_ptr,  # fp32
-    exp_avg_ptr,  # uint8
-    scale_ptr,  # fp32
-    min_ptr,  # fp32
+    exp_avg_ptr,  # int8
+    scale_ptr,  # fp16 absmax of state
     output_ptr,  # fp32
     beta,  # float
     rms_clip_scale,  # float
@@ -146,15 +138,13 @@ def fused_update_exp_avg_kernel(
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    # Load metadata (scalars per block)
-    old_scale = tl.load(scale_ptr + pid)
-    old_min = tl.load(min_ptr + pid)
+    # Load metadata
+    old_scale = tl.load(scale_ptr + pid).to(tl.float32)
 
-    # Load quantized state and convert to fp32
-    state_fp32 = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-
-    # Dequantize
-    state_fp32 = (state_fp32 * old_scale) + old_min
+    # Load quantized state and dequantize
+    state_i8 = tl.load(exp_avg_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    state_norm = state_i8 / 127.0
+    state_fp32 = (state_norm / (2.0 - tl.abs(state_norm))) * old_scale
 
     # Load update
     update_val = tl.load(update_ptr + offsets, mask=mask, other=0.0)
@@ -168,29 +158,23 @@ def fused_update_exp_avg_kernel(
     # Store the updated exp_avg (fp32) for subsequent instability calculation
     tl.store(output_ptr + offsets, state_fp32, mask=mask)
 
-    # Calculate new min/max for this quantization block
-    chunk_min = tl.min(tl.where(mask, state_fp32, 1e30), axis=0)
-    chunk_max = tl.max(tl.where(mask, state_fp32, -1e30), axis=0)
+    # Quantize state
+    absmax = tl.max(tl.where(mask, tl.abs(state_fp32), 0.0), axis=0)
+    is_absmax_zero = absmax == 0.0
 
-    scale = (chunk_max - chunk_min) / 255.0
-    is_scale_zero = scale == 0.0
-
-    # Normalize
-    state_norm = (state_fp32 - chunk_min) / tl.where(is_scale_zero, 1.0, scale)
+    normed = state_fp32 / tl.where(is_absmax_zero, 1.0, absmax)
+    companded = 2.0 * normed / (1.0 + tl.abs(normed))
 
     # Stochastic Rounding
-    state_norm = state_norm + tl.rand(seed, offsets)
-    state_norm = tl.floor(state_norm)
+    quantized = companded * 127.0 + tl.rand(seed, offsets)
+    quantized = tl.floor(quantized)
+    quantized = tl.clamp(quantized, -127, 127)
 
-    # Clamp to 0..255
-    state_norm = tl.clamp(state_norm, 0, 255)
-
-    # Store State (uint8)
-    tl.store(exp_avg_ptr + offsets, state_norm.to(tl.uint8), mask=mask)
+    # Store State (int8)
+    tl.store(exp_avg_ptr + offsets, quantized.to(tl.int8), mask=mask)
 
     # Store Metadata
-    tl.store(scale_ptr + pid, scale)
-    tl.store(min_ptr + pid, chunk_min)
+    tl.store(scale_ptr + pid, absmax.to(tl.float16))
 
 
 def apply_update_triton(
@@ -253,7 +237,6 @@ def fused_update_exp_avg_sq_triton(
 
     # Quantization metadata
     scales = quant_state["scales"]
-    mins = quant_state["mins"]
     block_size = quant_state["block_size"]
     num_blocks = scales.numel()
 
@@ -267,7 +250,6 @@ def fused_update_exp_avg_sq_triton(
         update_sq_flat,
         state_u8_flat,
         scales,
-        mins,
         float(beta),
         float(eps),
         float(bias_correction),
@@ -300,7 +282,6 @@ def fused_update_exp_avg_triton(
 
     # Quantization metadata
     scales = quant_state["scales"]
-    mins = quant_state["mins"]
     block_size = quant_state["block_size"]
     num_blocks = scales.numel()
 
@@ -313,7 +294,6 @@ def fused_update_exp_avg_triton(
         update_flat,
         state_u8_flat,
         scales,
-        mins,
         output_flat,
         float(beta),
         float(rms_clip_scale),
@@ -346,6 +326,7 @@ class CAME(Optimizer):
       - OrthoGrad Improves Neural Calibration (https://www.arxiv.org/abs/2506.04487)
       - Prodigy: An Expeditiously Adaptive Parameter-Free Learner (https://arxiv.org/abs/2306.06101)
       - The Road Less Scheduled (https://arxiv.org/abs/2405.15682)
+      - FlashOptim: Optimizers for Memory Efficient Training (https://arxiv.org/abs/2602.23349)
 
     Args:
         params (iterable): iterable of parameters to optimize or dicts defining parameter groups
@@ -372,6 +353,8 @@ class CAME(Optimizer):
             only used when enable_prodigy=True (default: 1e-6)
         enable_schedule_free (bool, optional): enable Schedule-Free optimization to remove the need
             for learning rate decay schedules (default: False)
+        schedule_free_r (float, optional): polynomial weighting exponent for the schedule-free
+            x-average; r=0 gives uniform weighting (default: 0.0)
     """
 
     def __init__(
@@ -392,6 +375,7 @@ class CAME(Optimizer):
         enable_prodigy=False,
         d0=1e-6,
         enable_schedule_free=False,
+        schedule_free_r=0.0,
     ):
         self.torch_gc()
 
@@ -418,6 +402,10 @@ class CAME(Optimizer):
             enable_prodigy=enable_prodigy,
             d0=d0,
             enable_schedule_free=enable_schedule_free,
+            schedule_free_r=schedule_free_r,
+            train_mode=False,
+            lr_max=-1.0,
+            weight_sum=0.0,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -535,19 +523,28 @@ class CAME(Optimizer):
             d_hat = r / s_l1_total
             group["prodigy_d"] = max(d, d_hat)
 
+    @torch.no_grad()
     def train(self, mode: bool = True):
         for group in self.param_groups:
             if not group.get("enable_schedule_free", False):
                 continue
-            for p in group["params"]:
-                state = self.state[p]
-                if "z" in state and "x" in state:
-                    if mode:
-                        beta1 = group["betas"][0]
-                        p.data.copy_(state["z"].lerp(state["x"], beta1))
-                    else:
-                        p.data.copy_(state["x"])
+            beta1 = group["betas"][0]
+            if mode and not group["train_mode"]:
+                # x -> y
+                for p in group["params"]:
+                    state = self.state[p]
+                    if "z" in state:
+                        p.data.lerp_(end=state["z"], weight=1 - beta1)
+                group["train_mode"] = True
+            elif not mode and group["train_mode"]:
+                # y -> x
+                for p in group["params"]:
+                    state = self.state[p]
+                    if "z" in state:
+                        p.data.lerp_(end=state["z"], weight=1 - 1 / beta1)
+                group["train_mode"] = False
 
+    @torch.no_grad()
     def eval(self):
         self.train(False)
 
@@ -580,13 +577,10 @@ class CAME(Optimizer):
                 block_size = group["block_size"]
                 num_blocks = (grad_numel + block_size - 1) // block_size
 
-                state["exp_avg"] = torch.zeros_like(grad, dtype=torch.uint8)
+                state["exp_avg"] = torch.zeros_like(grad, dtype=torch.int8)
                 state["exp_avg_quant_state"] = {
                     "scales": torch.zeros(
-                        num_blocks, dtype=torch.float32, device=grad.device
-                    ),
-                    "mins": torch.zeros(
-                        num_blocks, dtype=torch.float32, device=grad.device
+                        num_blocks, dtype=torch.float16, device=grad.device
                     ),
                     "block_size": block_size,
                     "shape": grad_shape,
@@ -611,10 +605,7 @@ class CAME(Optimizer):
                     state["exp_avg_sq"] = torch.zeros_like(grad, dtype=torch.uint8)
                     state["exp_avg_sq_quant_state"] = {
                         "scales": torch.zeros(
-                            num_blocks, dtype=torch.float32, device=grad.device
-                        ),
-                        "mins": torch.zeros(
-                            num_blocks, dtype=torch.float32, device=grad.device
+                            num_blocks, dtype=torch.float16, device=grad.device
                         ),
                         "block_size": block_size,
                         "shape": grad_shape,
@@ -687,6 +678,8 @@ class CAME(Optimizer):
 
         if group["enable_cautious_update"]:
             mask = (exp_avg * grad > 0).to(grad.dtype)
+            group["_cautious_update_num"] = group.get("_cautious_update_num", 0.0) + mask.sum().item()
+            group["_cautious_update_denom"] = group.get("_cautious_update_denom", 0.0) + mask.numel()
             mask.div_(mask.mean().clamp_(min=1e-3))
             exp_avg.mul_(mask)
 
@@ -722,31 +715,39 @@ class CAME(Optimizer):
         if group["enable_schedule_free"]:
             if "z" not in state:
                 state["z"] = p.data.clone()
-                state["x"] = p.data.clone()
-                state["lr_sq_sum"] = 0.0
 
-            lr_sq = effective_lr ** 2
-            state["lr_sq_sum"] += lr_sq
+            weight = group["_sf_ckp1"]
 
-            if state["lr_sq_sum"] > 0:
-                weight = lr_sq / state["lr_sq_sum"]
-            else:
-                weight = 1.0
+            # Accumulate sq distance before y is modified so the metric reflects y_t, not y_{t+1}
+            group["_sf_sq_dist"] += ((state["z"] - p.data) / beta1).pow(2).sum().item()
+
+            if group["weight_decay"] != 0:
+                if group["enable_cautious_weight_decay"]:
+                    wd_mask = (update * p.data >= 0).to(update.dtype)
+                    group["_cautious_wd_num"] = group.get("_cautious_wd_num", 0.0) + wd_mask.sum().item()
+                    group["_cautious_wd_denom"] = group.get("_cautious_wd_denom", 0.0) + wd_mask.numel()
+                    update.add_(p.data * wd_mask, alpha=group["weight_decay"] * bias_correction1)
+                else:
+                    update.add_(p.data, alpha=group["weight_decay"] * bias_correction1)
+
+            p.data.lerp_(end=state["z"], weight=weight)
+            p.data.add_(update, alpha=-effective_lr * (1 - beta1 * (1 - weight)) / bias_correction1)
 
             apply_update_triton(
                 A=state["z"],
                 B=update,
                 alpha=-effective_lr,
                 bias_correction=bias_correction1,
-                weight_decay=group["weight_decay"],
-                enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
+                weight_decay=0.0,
+                enable_cautious_weight_decay=False,
                 enable_stochastic_rounding=group["enable_stochastic_rounding"],
             )
-
-            state["x"].lerp_(state["z"], weight)
-
-            p.data.copy_(state["z"].lerp(state["x"], beta1))
         else:
+            if group["enable_cautious_weight_decay"] and group["weight_decay"] != 0:
+                wd_mask = (update * p.data >= 0)
+                group["_cautious_wd_num"] = group.get("_cautious_wd_num", 0.0) + wd_mask.sum().item()
+                group["_cautious_wd_denom"] = group.get("_cautious_wd_denom", 0.0) + wd_mask.numel()
+
             apply_update_triton(
                 A=p.data,
                 B=update,
@@ -756,6 +757,48 @@ class CAME(Optimizer):
                 enable_cautious_weight_decay=group["enable_cautious_weight_decay"],
                 enable_stochastic_rounding=group["enable_stochastic_rounding"],
             )
+
+    def _update_step_logs(self):
+        prodigy_d_values = []
+        effective_lr_values = []
+        sf_dist_z_x_values = []
+        sf_update_norm_values = []
+        total_cautious_update_num = 0.0
+        total_cautious_update_denom = 0.0
+        total_cautious_wd_num = 0.0
+        total_cautious_wd_denom = 0.0
+
+        for group in self.param_groups:
+            total_cautious_update_num += group["_cautious_update_num"]
+            total_cautious_update_denom += group["_cautious_update_denom"]
+            total_cautious_wd_num += group["_cautious_wd_num"]
+            total_cautious_wd_denom += group["_cautious_wd_denom"]
+
+            if group.get("enable_prodigy"):
+                prodigy_d_values.append(group["prodigy_d"])
+                effective_lr_values.append(group["lr"] * group["prodigy_d"])
+
+            if group.get("enable_schedule_free"):
+                sq_dist = group.get("_sf_sq_dist", 0.0)
+                step = group.get("_sf_step", 0)
+                if sq_dist > 0.0 and step > 0:
+                    dist = math.sqrt(sq_dist)
+                    sf_dist_z_x_values.append(dist)
+                    sf_update_norm_values.append(dist / step)
+
+        self.step_logs = {}
+        if prodigy_d_values:
+            self.step_logs["lr/prodigy_d"] = sum(prodigy_d_values) / len(prodigy_d_values)
+        if effective_lr_values:
+            self.step_logs["lr/effective_lr"] = sum(effective_lr_values) / len(effective_lr_values)
+        if sf_dist_z_x_values:
+            self.step_logs["lr/sf_dist_z_x"] = sum(sf_dist_z_x_values) / len(sf_dist_z_x_values)
+        if sf_update_norm_values:
+            self.step_logs["lr/sf_update_norm"] = sum(sf_update_norm_values) / len(sf_update_norm_values)
+        if total_cautious_update_denom > 0:
+            self.step_logs["cautious/update_ratio"] = total_cautious_update_num / total_cautious_update_denom
+        if total_cautious_wd_denom > 0:
+            self.step_logs["cautious/wd_ratio"] = total_cautious_wd_num / total_cautious_wd_denom
 
     @torch.inference_mode()
     def step(self, closure=None):
@@ -769,14 +812,36 @@ class CAME(Optimizer):
             loss = closure()
 
         for group in self.param_groups:
+            if group.get("enable_schedule_free") and not group["train_mode"]:
+                raise RuntimeError(
+                    "Schedule-Free is enabled but the optimizer is not in train mode. "
+                    "Call optimizer.train() before stepping, and optimizer.eval() before "
+                    "inference or saving checkpoints."
+                )
+
+            group["_cautious_update_num"] = 0.0
+            group["_cautious_update_denom"] = 0.0
+            group["_cautious_wd_num"] = 0.0
+            group["_cautious_wd_denom"] = 0.0
+
             if group["enable_prodigy"]:
                 if "prodigy_d" not in group:
                     group["prodigy_d"] = group["d0"]
                     group["prodigy_r"] = 0.0
                 self._prodigy_update_d(group)
 
-        for group in self.param_groups:
+            if group["enable_schedule_free"]:
+                sf_effective_lr = group["lr"] * group.get("prodigy_d", 1.0) if group["enable_prodigy"] else group["lr"]
+                group["lr_max"] = max(sf_effective_lr, group["lr_max"])
+                group["_sf_step"] = group.get("_sf_step", 0) + 1
+                lr_weight = (group["_sf_step"] ** group["schedule_free_r"]) * (group["lr_max"] ** 2)
+                group["weight_sum"] += lr_weight
+                group["_sf_ckp1"] = lr_weight / group["weight_sum"] if group["weight_sum"] > 0 else 0.0
+                group["_sf_sq_dist"] = 0.0
+
             for p in group["params"]:
                 self.step_param(p, group)
+
+        self._update_step_logs()
 
         return loss
