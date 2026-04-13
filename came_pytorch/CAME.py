@@ -385,6 +385,8 @@ class CAME(Optimizer):
         assert lr is not None and lr > 0.0
         assert d0 > 0.0
         assert all([0.0 <= beta <= 1.0 for beta in betas])
+        assert not (enable_schedule_free and enable_cautious_update), \
+            "Cautious Update interacts poorly with Schedule-Free. You must disable one."
 
         defaults = dict(
             lr=lr,
