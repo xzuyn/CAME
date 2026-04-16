@@ -23,7 +23,11 @@ def add_kernel(
     a = tl.load(a_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
-    a = a + (-lr) * (b + (weight_decay * a))
+    if weight_decay != 0.0:
+        decay_mask = (a * b) >= 0
+        b = b + (a * decay_mask.to(tl.float32)) * weight_decay
+
+    a = a + (-lr) * b
 
     tl.store(a_ptr + offsets, a, mask=mask)
 
