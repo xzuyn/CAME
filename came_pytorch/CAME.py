@@ -23,6 +23,7 @@ def add_kernel(
     a = tl.load(a_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(b_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
 
+    # Cautious Weight Decay
     if weight_decay != 0.0:
         decay_mask = (a * b) >= 0
         b = b + (a * decay_mask.to(tl.float32)) * weight_decay
@@ -203,6 +204,11 @@ class CAME(torch.optim.Optimizer):
 
                 exp_avg = state["exp_avg"]
                 exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
+
+                # Cautious Update
+                mask = (exp_avg * grad > 0).to(exp_avg.dtype)
+                mask.div_(mask.mean().clamp_(min=1e-3))
+                exp_avg.mul_(mask)
 
                 # Confidence-guided strategy
                 # Calculation of instability
