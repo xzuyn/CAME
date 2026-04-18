@@ -205,11 +205,6 @@ class CAME(torch.optim.Optimizer):
                 exp_avg = state["exp_avg"]
                 exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
 
-                # Cautious Update
-                mask = (exp_avg * grad > 0).to(exp_avg.dtype)
-                mask.div_(mask.mean().clamp_(min=1e-3))
-                exp_avg.mul_(mask)
-
                 # Confidence-guided strategy
                 # Calculation of instability
                 res = (update - exp_avg)**2 + group["eps"][1]
