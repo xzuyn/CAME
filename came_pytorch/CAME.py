@@ -177,6 +177,8 @@ class CAME(torch.optim.Optimizer):
                 state["step"] += 1
                 state["RMS"] = self._rms(p.data)
 
+                bias_correction1 = 1.0 - group["betas"][0] ** state["step"]
+                bias_correction2 = 1.0 - group["betas"][1] ** state["step"]
                 update = (grad**2) + group["eps"][0]
                 if factored:
                     exp_avg_sq_row = state["exp_avg_sq_row"]
@@ -190,13 +192,16 @@ class CAME(torch.optim.Optimizer):
                     )
 
                     # Approximation of exponential moving average of square of gradient
-                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+                    update = self._approx_sq_grad(
+                        exp_avg_sq_row / bias_correction2,
+                        exp_avg_sq_col / bias_correction2,
+                    )
                     update.mul_(grad)
                 else:
                     exp_avg_sq = state["exp_avg_sq"]
 
                     exp_avg_sq.mul_(group["betas"][1]).add_(update, alpha=1.0 - group["betas"][1])
-                    update = exp_avg_sq.rsqrt().mul_(grad)
+                    update = exp_avg_sq.div(bias_correction2).rsqrt().mul_(grad)
 
                 update.div_(
                     (self._rms(update) / group["clip_threshold"]).clamp_(min=1.0)
@@ -204,6 +209,7 @@ class CAME(torch.optim.Optimizer):
 
                 exp_avg = state["exp_avg"]
                 exp_avg.mul_(group["betas"][0]).add_(update, alpha=1 - group["betas"][0])
+                exp_avg_hat = exp_avg / bias_correction1
 
                 # Confidence-guided strategy
                 # Calculation of instability
@@ -221,10 +227,13 @@ class CAME(torch.optim.Optimizer):
                     )
 
                     # Approximation of exponential moving average of instability
-                    res_approx = self._approx_sq_grad(exp_avg_res_row, exp_avg_res_col)
-                    update = res_approx.mul_(exp_avg)
+                    res_approx = self._approx_sq_grad(
+                        exp_avg_res_row,
+                        exp_avg_res_col,
+                    )
+                    update = res_approx.mul_(exp_avg_hat)
                 else:
-                    update = exp_avg.clone()
+                    update = exp_avg_hat
 
                 apply_update_triton(
                     A=p.data,
