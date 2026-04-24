@@ -1,5 +1,4 @@
-import math
-
+import random
 import torch
 import torch.optim
 import triton
@@ -13,6 +12,8 @@ def add_kernel(
     lr,
     weight_decay,
     n_elements,
+    seed,
+    STOCHASTIC_ROUNDING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
@@ -30,7 +31,18 @@ def add_kernel(
 
     a = a + (-lr) * b
 
-    tl.store(a_ptr + offsets, a, mask=mask)
+    if STOCHASTIC_ROUNDING:
+        # bitcast fp32 to u32
+        a_u32 = a.cast(tl.uint32, bitcast=True)
+        # add noise to the lower 16 bits
+        a_u32 = a_u32 + (tl.randint(seed, offsets) & 0xFFFF)
+        # mask off the lower 16 bits
+        a_u32 = a_u32 & 0xFFFF0000
+        # bitcast back to float and then convert to bf16 for storage
+        a_rounded = a_u32.cast(tl.float32, bitcast=True).to(tl.bfloat16)
+        tl.store(a_ptr + offsets, a_rounded, mask=mask)
+    else:
+        tl.store(a_ptr + offsets, a, mask=mask)
 
 
 def apply_update_triton(
@@ -40,9 +52,9 @@ def apply_update_triton(
     weight_decay=0.0,
 ):
     if not A.is_cuda or not B.is_cuda:
-        raise RuntimeError("Triton CAME requires CUDA tensors.")
+        raise RuntimeError("Triton kernel requires CUDA tensors.")
     if not A.is_contiguous() or not B.is_contiguous():
-        raise RuntimeError("Triton CAME requires contiguous tensors.")
+        raise RuntimeError("Triton kernel requires contiguous tensors.")
 
     n_elements = A.numel()
     if n_elements == 0:
@@ -61,6 +73,8 @@ def apply_update_triton(
             float(lr),
             float(weight_decay),
             n_elements,
+            int(random.randint(0, 2**32 - 1)),
+            STOCHASTIC_ROUNDING=bool(A.dtype == torch.bfloat16),
             BLOCK_SIZE=1024,
         )
 
