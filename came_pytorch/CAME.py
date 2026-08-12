@@ -24,6 +24,9 @@ class CAME(torch.optim.Optimizer):
             (pre-learning-rate) optimizer update and the current parameter share the same sign,
             i.e. where decay would not fight the optimizer's own update direction. Only has an
             effect when weight_decay > 0. Off by default.
+        stochastic_rounding (boolean, optional):
+            Use stochastic rounding for the in-place parameter updates. Only affects
+            bfloat16 parameters (no-op otherwise). Off by default.
     """
 
     def __init__(
@@ -35,6 +38,7 @@ class CAME(torch.optim.Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         cautious_weight_decay=False,
+        stochastic_rounding=False,
     ):
         assert lr > 0.
         assert all([0. <= beta <= 1. for beta in betas])
@@ -46,6 +50,7 @@ class CAME(torch.optim.Optimizer):
             betas=betas,
             weight_decay=weight_decay,
             cautious_weight_decay=cautious_weight_decay,
+            stochastic_rounding=stochastic_rounding,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -57,6 +62,33 @@ class CAME(torch.optim.Optimizer):
     def supports_flat_params(self):
         return False
 
+    def _add_stochastic(self, A, B, alpha=1.0):
+        # compute A + (alpha * B) in float32
+        result = A.to(dtype=torch.float32).clone()
+        result.add_(B.to(dtype=torch.float32), alpha=alpha)
+
+        # ensure contiguous memory for safe bit reinterpretation
+        result = result.contiguous()
+
+        # create a random 16-bit integer per element
+        rnd = torch.randint(
+            size=result.shape,
+            device=result.device,
+            dtype=torch.int32,
+            low=0,
+            high=(1 << 16),
+        )
+
+        # add the random number to the lower 16 bit of the mantissa
+        rnd.add_(result.view(dtype=torch.int32))
+
+        # mask off the lower 16 bit of the mantissa
+        rnd.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
+
+        # reinterpret the masked int32 as float32 and copy into A
+        A.copy_(rnd.view(dtype=torch.float32))
+
+        del rnd, result
 
     def _get_options(self, param_shape):
         factored = len(param_shape) >= 2
@@ -96,6 +128,7 @@ class CAME(torch.optim.Optimizer):
 
                 state = self.state[p]
                 grad_shape = grad.shape
+                stochastic_rounding = group["stochastic_rounding"] and p.dtype == torch.bfloat16
 
                 factored = self._get_options(grad_shape)
                 # State Initialization
@@ -175,15 +208,28 @@ class CAME(torch.optim.Optimizer):
                         # Cautious Weight Decay (Chen et al., 2025): only decay where the
                         # update and the parameter share a sign, i.e. u_t * x_t >= 0.
                         mask = (update * p.data >= 0).to(p.dtype)
-                        p.data.add_(
-                            p.data * mask, alpha=-group["weight_decay"] * group["lr"]
-                        )
+                        if stochastic_rounding:
+                            self._add_stochastic(
+                                A=p.data, B=p.data * mask, alpha=-group["weight_decay"] * group["lr"]
+                            )
+                        else:
+                            p.data.add_(
+                                p.data * mask, alpha=-group["weight_decay"] * group["lr"]
+                            )
                     else:
-                        p.data.add_(
-                            p.data, alpha=-group["weight_decay"] * group["lr"]
-                        )
+                        if stochastic_rounding:
+                            self._add_stochastic(
+                                A=p.data, B=p.data, alpha=-group["weight_decay"] * group["lr"]
+                            )
+                        else:
+                            p.data.add_(
+                                p.data, alpha=-group["weight_decay"] * group["lr"]
+                            )
 
                 update.mul_(group["lr"])
-                p.data.add_(-update)
+                if stochastic_rounding:
+                    self._add_stochastic(A=p.data, B=update, alpha=-1.0)
+                else:
+                    p.data.add_(-update)
 
         return loss
