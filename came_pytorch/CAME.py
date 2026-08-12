@@ -19,6 +19,11 @@ class CAME(torch.optim.Optimizer):
         betas (tuple[float, float, float]): coefficient used for computing running averages of
         update, square gradient and instability (default: (0.9, 0.999, 0.9999)))
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        cautious_weight_decay (boolean, optional):
+            Apply Cautious Weight Decay (Chen et al., 2025): only decay coordinates where the
+            (pre-learning-rate) optimizer update and the current parameter share the same sign,
+            i.e. where decay would not fight the optimizer's own update direction. Only has an
+            effect when weight_decay > 0. Off by default.
     """
 
     def __init__(
@@ -29,6 +34,7 @@ class CAME(torch.optim.Optimizer):
         clip_threshold=1.0,
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
+        cautious_weight_decay=False,
     ):
         assert lr > 0.
         assert all([0. <= beta <= 1. for beta in betas])
@@ -39,6 +45,7 @@ class CAME(torch.optim.Optimizer):
             clip_threshold=clip_threshold,
             betas=betas,
             weight_decay=weight_decay,
+            cautious_weight_decay=cautious_weight_decay,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -164,7 +171,15 @@ class CAME(torch.optim.Optimizer):
                     update = exp_avg.clone()
 
                 if group["weight_decay"] != 0:
-                    p.data.add_(
+                    if group["cautious_weight_decay"]:
+                        # Cautious Weight Decay (Chen et al., 2025): only decay where the
+                        # update and the parameter share a sign, i.e. u_t * x_t >= 0.
+                        mask = (update * p.data >= 0).to(p.dtype)
+                        p.data.add_(
+                            p.data * mask, alpha=-group["weight_decay"] * group["lr"]
+                        )
+                    else:
+                        p.data.add_(
                             p.data, alpha=-group["weight_decay"] * group["lr"]
                         )
 
