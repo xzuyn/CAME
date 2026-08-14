@@ -24,6 +24,11 @@ class CAME(torch.optim.Optimizer):
             (pre-learning-rate) optimizer update and the current parameter share the same sign,
             i.e. where decay would not fight the optimizer's own update direction. Only has an
             effect when weight_decay > 0. Off by default.
+        cautious_update (boolean, optional):
+            Apply Cautious Optimizer modification (Liang et al., 2024): only update coordinates
+            where the proposed update direction and the current gradient share the same sign
+            (u_t * g_t > 0), rescaled by the active coordinate ratio to prevent magnitude loss.
+            Off by default.
     """
 
     def __init__(
@@ -35,6 +40,7 @@ class CAME(torch.optim.Optimizer):
         betas=(0.9, 0.999, 0.9999),
         weight_decay=0.0,
         cautious_weight_decay=False,
+        cautious_update=False,
     ):
         assert lr > 0.
         assert all([0. <= beta <= 1. for beta in betas])
@@ -46,6 +52,7 @@ class CAME(torch.optim.Optimizer):
             betas=betas,
             weight_decay=weight_decay,
             cautious_weight_decay=cautious_weight_decay,
+            cautious_update=cautious_update,
         )
         super(CAME, self).__init__(params, defaults)
 
@@ -169,6 +176,13 @@ class CAME(torch.optim.Optimizer):
                     update = res_approx.mul_(exp_avg)
                 else:
                     update = exp_avg.clone()
+
+                if group["cautious_update"]:
+                    # Cautious Optimizer (Liang et al., 2024): zero out coordinates where
+                    # update conflicts with gradient (u_t * g_t <= 0) and scale by active ratio.
+                    mask = (update * grad > 0).to(grad.dtype)
+                    mask.div_(mask.mean().clamp_(min=1e-3))
+                    update.mul_(mask)
 
                 if group["weight_decay"] != 0:
                     if group["cautious_weight_decay"]:
