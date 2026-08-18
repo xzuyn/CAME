@@ -131,13 +131,13 @@ class CAME(torch.optim.Optimizer):
         is_scale_zero = scales == 0
         safe_scales = torch.where(is_scale_zero, 1.0, scales).unsqueeze(1)
 
-        A.div_(safe_scales)
-        A.add_(torch.rand_like(A))
-        A.floor_()
-        A.clamp_(-qmax, qmax)
-        A.masked_fill_(is_scale_zero.unsqueeze(1), 0.0)
-        A.add_(qmax)
-        A = A.to(torch.uint8)
+        A_norm = A / safe_scales
+        A_norm.add_(torch.rand_like(A_norm))
+        A_norm.clamp_(-qmax, qmax)
+        A_norm.floor_()
+        A_norm.masked_fill_(is_scale_zero.unsqueeze(1), 0.0)
+        A_norm.add_(qmax)
+        A = A_norm.to(torch.uint8)
         A = A.flatten()
         A = A[:n_elements]
 
