@@ -110,8 +110,7 @@ class CAME(torch.optim.Optimizer):
 
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
     def _quantize_state(self, A, block_size, nbits=8):
-        # TODO: better sub-4-bit quantization
-        assert 3 <= nbits <= 8, f"nbits must be between 4 and 8 for uint8 storage, got {nbits}"
+        assert 1 <= nbits <= 8, f"nbits must be between 1 and 8 for uint8 storage, got {nbits}"
 
         n_elements = A.numel()
         if n_elements <= 1:
@@ -126,19 +125,31 @@ class CAME(torch.optim.Optimizer):
             A = torch.nn.functional.pad(A, (0, pad_len), "replicate")
         A = A.view(num_blocks, block_size)
 
-        qmax = 1.0 if nbits == 1 else float((1 << (nbits - 1)) - 1)
-        scales = A.abs().max(dim=1).values / qmax
-        is_scale_zero = scales == 0
-        safe_scales = torch.where(is_scale_zero, 1.0, scales).unsqueeze(1)
+        qmax = 1.0 if nbits <= 2 else float((1 << (nbits - 1)) - 1)
 
-        A_norm = A / safe_scales
-        A_norm.add_(torch.rand_like(A_norm))
-        A_norm.clamp_(-qmax, qmax)
-        A_norm.floor_()
-        A_norm.masked_fill_(is_scale_zero.unsqueeze(1), 0.0)
-        A_norm.add_(qmax)
-        A = A_norm.to(torch.uint8)
-        A = A.flatten()
+        if nbits == 1:
+            scales = A.abs().mean(dim=1)
+            A_norm = (A >= 0).to(torch.uint8)
+            A_norm.masked_fill_((scales == 0).unsqueeze(1), 0)
+            A = A_norm.flatten()
+        elif nbits == 2:
+            delta = 0.7 * A.abs().mean(dim=1, keepdim=True)
+            nz_mask = A.abs() > delta
+            scales = (A.abs() * nz_mask).sum(dim=1) / nz_mask.sum(dim=1).clamp_min(1)
+            A_norm = torch.where(nz_mask, torch.sign(A), torch.zeros_like(A))
+            A_norm.add_(qmax)
+            A = A_norm.to(torch.uint8).flatten()
+        else:
+            scales = A.abs().max(dim=1).values / qmax
+            safe_scales = torch.where(scales == 0, 1.0, scales).unsqueeze(1)
+            A_norm = A / safe_scales
+            A_norm.add_(torch.rand_like(A_norm))
+            A_norm.clamp_(-qmax, qmax)
+            A_norm.floor_()
+            A_norm.masked_fill_((scales == 0).unsqueeze(1), 0.0)
+            A_norm.add_(qmax)
+            A = A_norm.to(torch.uint8)
+            A = A.flatten()
         A = A[:n_elements]
 
         if nbits == 4:
@@ -149,6 +160,8 @@ class CAME(torch.optim.Optimizer):
             A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
         elif nbits < 8:
             pack_cfg = {
+                1: (8, torch.uint8, 1, 0x01, 7),   # 8 x 1-bit per uint8 ( 8/ 8)
+                2: (4, torch.uint8, 2, 0x03, 6),   # 4 x 2-bit per uint8 ( 8/ 8)
                 3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
                 5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
                 6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
@@ -186,6 +199,8 @@ class CAME(torch.optim.Optimizer):
             A = unpacked[:n_elements]
         elif nbits < 8:
             pack_cfg = {
+                1: (8, torch.uint8, 1, 0x01, 7),   # 8 x 1-bit per uint8 ( 8/ 8)
+                2: (4, torch.uint8, 2, 0x03, 6),   # 4 x 2-bit per uint8 ( 8/ 8)
                 3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
                 5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
                 6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
@@ -204,7 +219,10 @@ class CAME(torch.optim.Optimizer):
             A = torch.nn.functional.pad(A.unsqueeze(0), (0, pad_len), "constant", 0).squeeze(0)
 
         A = A.view(num_blocks, block_size).float()
-        A.sub_(quant_state["qmax"])
+        if nbits == 1:
+            A.mul_(2.0).sub_(1.0)
+        else:
+            A.sub_(quant_state["qmax"])
         A.mul_(quant_state["scales"].unsqueeze(1))
         A = A.flatten()[:n_elements]
 
