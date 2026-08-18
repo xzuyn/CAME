@@ -131,10 +131,13 @@ class CAME(torch.optim.Optimizer):
         is_scale_zero = scales == 0
         safe_scales = torch.where(is_scale_zero, 1.0, scales).unsqueeze(1)
 
-        A_norm = A / safe_scales
-        A = torch.floor(A_norm + torch.rand_like(A_norm)).clamp(-qmax, qmax)
-        A = torch.where(is_scale_zero.unsqueeze(1), 0.0, A)
-        A = (A + qmax).to(torch.uint8)
+        A.div_(safe_scales)
+        A.add_(torch.rand_like(A))
+        A.floor_()
+        A.clamp_(-qmax, qmax)
+        A.masked_fill_(is_scale_zero.unsqueeze(1), 0.0)
+        A.add_(qmax)
+        A = A.to(torch.uint8)
         A = A.flatten()
         A = A[:n_elements]
 
@@ -190,7 +193,8 @@ class CAME(torch.optim.Optimizer):
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
-            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8).flatten()[:n_elements]
+            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8)
+            A = A.flatten()[:n_elements]
 
         block_size = quant_state["block_size"]
         num_blocks = (n_elements + block_size - 1) // block_size
@@ -200,7 +204,8 @@ class CAME(torch.optim.Optimizer):
             A = torch.nn.functional.pad(A.unsqueeze(0), (0, pad_len), "constant", 0).squeeze(0)
 
         A = A.view(num_blocks, block_size).float()
-        A = (A - quant_state["qmax"]) * quant_state["scales"].unsqueeze(1)
+        A.sub_(quant_state["qmax"])
+        A.mul_(quant_state["scales"].unsqueeze(1))
         A = A.flatten()[:n_elements]
 
         return A.reshape(quant_state["shape"])
