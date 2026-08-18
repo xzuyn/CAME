@@ -111,7 +111,7 @@ class CAME(torch.optim.Optimizer):
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
     def _quantize_state(self, A, block_size, nbits=8):
         # TODO: better sub-4-bit quantization
-        assert 4 <= nbits <= 8, f"nbits must be between 4 and 8 for uint8 storage, got {nbits}"
+        assert 3 <= nbits <= 8, f"nbits must be between 4 and 8 for uint8 storage, got {nbits}"
 
         n_elements = A.numel()
         if n_elements <= 1:
@@ -146,6 +146,7 @@ class CAME(torch.optim.Optimizer):
             A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
         elif nbits < 8:
             pack_cfg = {
+                3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
                 5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32 (30/32)
                 6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
                 7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
@@ -182,9 +183,10 @@ class CAME(torch.optim.Optimizer):
             A = unpacked[:n_elements]
         elif nbits < 8:
             pack_cfg = {
-                5: (6, torch.int32, 5, 0x1F, 25),
-                6: (5, torch.int32, 6, 0x3F, 24),
-                7: (9, torch.int64, 7, 0x7F, 56),
+                3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
+                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32 (30/32)
+                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
+                7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
