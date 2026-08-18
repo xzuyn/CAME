@@ -150,7 +150,7 @@ class CAME(torch.optim.Optimizer):
         elif nbits < 8:
             pack_cfg = {
                 3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
-                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32 (30/32)
+                5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
                 6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
                 7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
             }
@@ -187,7 +187,7 @@ class CAME(torch.optim.Optimizer):
         elif nbits < 8:
             pack_cfg = {
                 3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
-                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32 (30/32)
+                5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
                 6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
                 7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
             }
