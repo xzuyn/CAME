@@ -250,7 +250,7 @@ class CAME(Optimizer):
                 state["exp_avg_res_col"] = torch.zeros(grad_shape[:-2] + grad_shape[-1:]).type_as(grad)
             else:
                 if use_quantization:
-                    state["exp_avg_sq"], state["exp_avg_quant_state"] = self._quantize_state_pytorch(
+                    state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self._quantize_state_pytorch(
                         A=torch.zeros_like(grad),
                         block_size=group["block_size"],
                     )
