@@ -111,7 +111,6 @@ class CAME(torch.optim.Optimizer):
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
     def _quantize_state(self, A, block_size, nbits=8):
         # TODO: better sub-4-bit quantization
-        # TODO: sub-8-bit packing
         assert 4 <= nbits <= 8, f"nbits must be between 4 and 8 for uint8 storage, got {nbits}"
 
         n_elements = A.numel()
@@ -121,12 +120,13 @@ class CAME(torch.optim.Optimizer):
         num_blocks = (n_elements + block_size - 1) // block_size
 
         shape = A.shape
-        A = A.unsqueeze(0)
-        A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "replicate")
-        A = A.squeeze(0)
+        A = A.flatten().unsqueeze(0)
+        pad_len = num_blocks * block_size - n_elements
+        if pad_len > 0:
+            A = torch.nn.functional.pad(A, (0, pad_len), "replicate")
         A = A.view(num_blocks, block_size)
 
-        qmax = 127.0 if nbits == 8 else float(1 << (nbits - 1))
+        qmax = 1.0 if nbits == 1 else float((1 << (nbits - 1)) - 1)
         scales = A.abs().max(dim=1).values / qmax
         is_scale_zero = scales == 0
         safe_scales = torch.where(is_scale_zero, 1.0, scales).unsqueeze(1)
@@ -138,29 +138,68 @@ class CAME(torch.optim.Optimizer):
         A = A.flatten()
         A = A[:n_elements]
 
+        if nbits == 4:
+            pack_pad = (-n_elements) % 2
+            if pack_pad > 0:
+                A = torch.nn.functional.pad(A.unsqueeze(0), (0, pack_pad), "constant", 0).squeeze(0)
+            chunks = A.view(-1, 2)
+            A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
+        elif nbits < 8:
+            pack_cfg = {
+                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32
+                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32
+                7: (4, torch.int32, 7, 0x7F, 21),  # 4 x 7-bit per int32
+            }
+            chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
+            pack_pad = (-n_elements) % chunk_size
+            if pack_pad > 0:
+                A = torch.nn.functional.pad(A.unsqueeze(0), (0, pack_pad), "constant", 0).squeeze(0)
+            chunks = A.to(dtype).view(-1, chunk_size)
+
+            shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
+            A = (((chunks & mask) << shifts).sum(dim=-1)).to(dtype)
+
         return A, {
             "scales": scales,
             "qmax": qmax,
             "block_size": block_size,
             "shape": shape,
+            "n_elements": n_elements,
             "nbits": nbits,
         }
 
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L565C1-L582C33
     def _dequantize_state(self, A, quant_state):
-        n_elements = A.numel()
+        n_elements = quant_state.get("n_elements", A.numel())
         if n_elements <= 1:
             return A
+
+        nbits = quant_state.get("nbits", 8)
+        if nbits == 4:
+            unpacked = torch.empty((A.numel() * 2,), dtype=torch.uint8, device=A.device)
+            unpacked[0::2] = (A >> 4) & 0x0F
+            unpacked[1::2] = A & 0x0F
+            A = unpacked[:n_elements]
+        elif nbits < 8:
+            pack_cfg = {
+                5: (6, torch.int32, 5, 0x1F, 25),
+                6: (5, torch.int32, 6, 0x3F, 24),
+                7: (4, torch.int32, 7, 0x7F, 21),
+            }
+            chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
+            shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
+            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8).flatten()[:n_elements]
 
         block_size = quant_state["block_size"]
         num_blocks = (n_elements + block_size - 1) // block_size
 
-        A = torch.nn.functional.pad(A, (0, (num_blocks * block_size - n_elements)), "constant", 0)
-        A = A.view(num_blocks, block_size)
-        A = A.float()
+        pad_len = num_blocks * block_size - n_elements
+        if pad_len > 0:
+            A = torch.nn.functional.pad(A.unsqueeze(0), (0, pad_len), "constant", 0).squeeze(0)
+
+        A = A.view(num_blocks, block_size).float()
         A = (A - quant_state["qmax"]) * quant_state["scales"].unsqueeze(1)
-        A = A.flatten()
-        A = A[:n_elements]
+        A = A.flatten()[:n_elements]
 
         return A.reshape(quant_state["shape"])
 
