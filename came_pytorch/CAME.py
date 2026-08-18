@@ -110,7 +110,7 @@ class CAME(torch.optim.Optimizer):
 
     # Reference: https://github.com/NVlabs/Sana/blob/3fed41f52a5300c3063068b5f7c5dfffb4fd0f3e/diffusion/utils/optimizer.py#L537C1-L563C32
     def _quantize_state(self, A, block_size, nbits=8):
-        assert 1 <= nbits <= 8, f"nbits must be between 1 and 8 for uint8 storage, got {nbits}"
+        assert 1 <= nbits <= 16, f"nbits must be between 1 and 16, got {nbits}"
 
         n_elements = A.numel()
         if n_elements <= 1:
@@ -148,7 +148,7 @@ class CAME(torch.optim.Optimizer):
             A_norm.floor_()
             A_norm.masked_fill_((scales == 0).unsqueeze(1), 0.0)
             A_norm.add_(qmax)
-            A = A_norm.to(torch.uint8)
+            A = A_norm.to(torch.uint8 if nbits <= 8 else torch.int32)
             A = A.flatten()
         A = A[:n_elements]
 
@@ -158,14 +158,23 @@ class CAME(torch.optim.Optimizer):
                 A = torch.nn.functional.pad(A.unsqueeze(0), (0, pack_pad), "constant", 0).squeeze(0)
             chunks = A.view(-1, 2)
             A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
-        elif nbits < 8:
+        elif nbits == 16:
+            A = A.to(torch.uint16)
+        elif nbits in (1, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15):
             pack_cfg = {
-                1: (8, torch.uint8, 1, 0x01, 7),   # 8 x 1-bit per uint8 ( 8/ 8)
-                2: (4, torch.uint8, 2, 0x03, 6),   # 4 x 2-bit per uint8 ( 8/ 8)
-                3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
-                5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
-                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
-                7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
+                 1: (8, torch.uint8,  1,   0x01,  7),  # 8 x  1-bit per uint8 ( 8/ 8)
+                 2: (4, torch.uint8,  2,   0x03,  6),  # 4 x  2-bit per uint8 ( 8/ 8)
+                 3: (5, torch.int16,  3,   0x07, 12),  # 5 x  3-bit per int16 (15/16)
+                 5: (3, torch.int16,  5,   0x1F, 10),  # 3 x  5-bit per int16 (15/16)
+                 6: (5, torch.int32,  6,   0x3F, 24),  # 5 x  6-bit per int32 (30/32)
+                 7: (9, torch.int64,  7,   0x7F, 56),  # 9 x  7-bit per int64 (63/64)
+                 9: (7, torch.int64,  9,  0x1FF, 54),  # 7 x  9-bit per int64 (63/64)
+                10: (3, torch.int32, 10,  0x3FF, 20),  # 3 x 10-bit per int32 (30/32)
+                11: (5, torch.int64, 11,  0x7FF, 44),  # 5 x 11-bit per int64 (55/64)
+                12: (5, torch.int64, 12,  0xFFF, 48),  # 5 x 12-bit per int64 (60/64)
+                13: (1, torch.int16, 13, 0x1FFF,  0),  # 1 x 13-bit per int16 (13/16)
+                14: (1, torch.int16, 14, 0x3FFF,  0),  # 1 x 14-bit per int16 (14/16)
+                15: (1, torch.int16, 15, 0x7FFF,  0),  # 1 x 15-bit per int16 (15/16)
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             pack_pad = (-n_elements) % chunk_size
@@ -197,18 +206,27 @@ class CAME(torch.optim.Optimizer):
             unpacked[0::2] = (A >> 4) & 0x0F
             unpacked[1::2] = A & 0x0F
             A = unpacked[:n_elements]
-        elif nbits < 8:
+        elif nbits == 16:
+            A = A[:n_elements]
+        elif nbits in (1, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15):
             pack_cfg = {
-                1: (8, torch.uint8, 1, 0x01, 7),   # 8 x 1-bit per uint8 ( 8/ 8)
-                2: (4, torch.uint8, 2, 0x03, 6),   # 4 x 2-bit per uint8 ( 8/ 8)
-                3: (5, torch.int16, 3, 0x07, 12),  # 5 x 3-bit per int16 (15/16)
-                5: (3, torch.int16, 5, 0x1F, 10),  # 3 x 5-bit per int16 (15/16)
-                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
-                7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
+                 1: (8, torch.uint8,  1,   0x01,  7),  # 8 x  1-bit per uint8 ( 8/ 8)
+                 2: (4, torch.uint8,  2,   0x03,  6),  # 4 x  2-bit per uint8 ( 8/ 8)
+                 3: (5, torch.int16,  3,   0x07, 12),  # 5 x  3-bit per int16 (15/16)
+                 5: (3, torch.int16,  5,   0x1F, 10),  # 3 x  5-bit per int16 (15/16)
+                 6: (5, torch.int32,  6,   0x3F, 24),  # 5 x  6-bit per int32 (30/32)
+                 7: (9, torch.int64,  7,   0x7F, 56),  # 9 x  7-bit per int64 (63/64)
+                 9: (7, torch.int64,  9,  0x1FF, 54),  # 7 x  9-bit per int64 (63/64)
+                10: (3, torch.int32, 10,  0x3FF, 20),  # 3 x 10-bit per int32 (30/32)
+                11: (5, torch.int64, 11,  0x7FF, 44),  # 5 x 11-bit per int64 (55/64)
+                12: (5, torch.int64, 12,  0xFFF, 48),  # 5 x 12-bit per int64 (60/64)
+                13: (1, torch.int16, 13, 0x1FFF,  0),  # 1 x 13-bit per int16 (13/16)
+                14: (1, torch.int16, 14, 0x3FFF,  0),  # 1 x 14-bit per int16 (14/16)
+                15: (1, torch.int16, 15, 0x7FFF,  0),  # 1 x 15-bit per int16 (15/16)
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
-            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8)
+            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8 if nbits <= 8 else torch.int32)
             A = A.flatten()[:n_elements]
 
         block_size = quant_state["block_size"]
