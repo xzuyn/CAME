@@ -119,10 +119,10 @@ class CAME(torch.optim.Optimizer):
         num_blocks = (n_elements + block_size - 1) // block_size
 
         shape = A.shape
-        A = A.flatten().unsqueeze(0)
+        A = A.flatten()
         pad_len = num_blocks * block_size - n_elements
         if pad_len > 0:
-            A = torch.nn.functional.pad(A, (0, pad_len), "replicate")
+            A = torch.nn.functional.pad(A.unsqueeze(0), (0, pad_len), "replicate").squeeze(0)
         A = A.view(num_blocks, block_size)
 
         qmax = 1.0 if nbits <= 2 else float((1 << (nbits - 1)) - 1)
@@ -148,14 +148,14 @@ class CAME(torch.optim.Optimizer):
             A_norm.floor_()
             A_norm.masked_fill_((scales == 0).unsqueeze(1), 0.0)
             A_norm.add_(qmax)
-            A = A_norm.to(torch.uint8 if nbits <= 8 else torch.int32)
-            A = A.flatten()
+            A = A_norm.to(torch.uint8 if nbits <= 8 else torch.int32).flatten()
+            del A_norm, safe_scales
         A = A[:n_elements]
 
         if nbits == 4:
             pack_pad = (-n_elements) % 2
             if pack_pad > 0:
-                A = torch.nn.functional.pad(A.unsqueeze(0), (0, pack_pad), "constant", 0).squeeze(0)
+                A = torch.nn.functional.pad(A, (0, pack_pad), "constant", 0)
             chunks = A.view(-1, 2)
             A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
         elif nbits == 16:
@@ -179,11 +179,14 @@ class CAME(torch.optim.Optimizer):
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             pack_pad = (-n_elements) % chunk_size
             if pack_pad > 0:
-                A = torch.nn.functional.pad(A.unsqueeze(0), (0, pack_pad), "constant", 0).squeeze(0)
-            chunks = A.to(dtype).view(-1, chunk_size)
+                A = torch.nn.functional.pad(A, (0, pack_pad), "constant", 0)
 
-            shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
-            A = (((chunks & mask) << shifts).sum(dim=-1)).to(dtype)
+            chunks = A.view(-1, chunk_size)
+            packed = torch.zeros(chunks.shape[0], dtype=dtype, device=A.device)
+            for i in range(chunk_size):
+                shift = start_shift - i * step
+                packed |= ((chunks[:, i].to(dtype) & mask) << shift)
+            A = packed
 
         return A, {
             "scales": scales,
@@ -225,16 +228,22 @@ class CAME(torch.optim.Optimizer):
                 15: (1, torch.int16, 15, 0x7FFF,  0),  # 1 x 15-bit per int16 (15/16)
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
-            shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
-            A = ((A.unsqueeze(-1) >> shifts) & mask).to(torch.uint8 if nbits <= 8 else torch.int32)
-            A = A.flatten()[:n_elements]
+            unpacked = torch.empty(
+                (A.numel() * chunk_size,),
+                dtype=torch.uint8 if nbits <= 8 else torch.int32,
+                device=A.device
+            )
+            for i in range(chunk_size):
+                shift = start_shift - i * step
+                unpacked[i::chunk_size] = ((A >> shift) & mask).to(unpacked.dtype)
+            A = unpacked[:n_elements]
 
         block_size = quant_state["block_size"]
         num_blocks = (n_elements + block_size - 1) // block_size
 
         pad_len = num_blocks * block_size - n_elements
         if pad_len > 0:
-            A = torch.nn.functional.pad(A.unsqueeze(0), (0, pad_len), "constant", 0).squeeze(0)
+            A = torch.nn.functional.pad(A, (0, pad_len), "constant", 0)
 
         A = A.view(num_blocks, block_size).float()
         if nbits == 1:
