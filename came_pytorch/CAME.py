@@ -146,9 +146,9 @@ class CAME(torch.optim.Optimizer):
             A = (chunks[:, 0] << 4) | (chunks[:, 1] & 0x0F)
         elif nbits < 8:
             pack_cfg = {
-                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32
-                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32
-                7: (4, torch.int32, 7, 0x7F, 21),  # 4 x 7-bit per int32
+                5: (6, torch.int32, 5, 0x1F, 25),  # 6 x 5-bit per int32 (30/32)
+                6: (5, torch.int32, 6, 0x3F, 24),  # 5 x 6-bit per int32 (30/32)
+                7: (9, torch.int64, 7, 0x7F, 56),  # 9 x 7-bit per int64 (63/64)
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             pack_pad = (-n_elements) % chunk_size
@@ -184,7 +184,7 @@ class CAME(torch.optim.Optimizer):
             pack_cfg = {
                 5: (6, torch.int32, 5, 0x1F, 25),
                 6: (5, torch.int32, 6, 0x3F, 24),
-                7: (4, torch.int32, 7, 0x7F, 21),
+                7: (9, torch.int64, 7, 0x7F, 56),
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             shifts = torch.arange(start_shift, start_shift - chunk_size * step, -step, device=A.device, dtype=dtype)
