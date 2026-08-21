@@ -315,6 +315,31 @@ class CAME(torch.optim.Optimizer):
                             state["exp_avg_sq"] = torch.zeros_like(grad)
 
                     state["RMS"] = 0
+                else:
+                    # unquantized -> quantized
+                    if use_quantization:
+                        if "exp_avg_quant_state" not in state:
+                            state["exp_avg"], state["exp_avg_quant_state"] = self._quantize_state(
+                                A=state["exp_avg"],
+                                block_size=group["quant_block_size"],
+                                nbits=group["quant_nbits"],
+                            )
+                        if not factored and "exp_avg_sq_quant_state" not in state:
+                            state["exp_avg_sq"], state["exp_avg_sq_quant_state"] = self._quantize_state(
+                                A=state["exp_avg_sq"],
+                                block_size=group["quant_block_size"],
+                                nbits=group["quant_nbits"],
+                            )
+                    # quantized -> unquantized
+                    else:
+                        if "exp_avg_quant_state" in state:
+                            state["exp_avg"] = self._dequantize_state(
+                                state["exp_avg"], state.pop("exp_avg_quant_state")
+                            )
+                        if not factored and "exp_avg_sq_quant_state" in state:
+                            state["exp_avg_sq"] = self._dequantize_state(
+                                state["exp_avg_sq"], state.pop("exp_avg_sq_quant_state")
+                            )
 
                 state["step"] += 1
                 state["RMS"] = self._rms(p.data)
