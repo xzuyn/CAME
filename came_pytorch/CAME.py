@@ -77,11 +77,11 @@ class CAME(torch.optim.Optimizer):
         return False
 
     def load_state_dict(self, state_dict):
-        current_overrides = [
-            {k: g[k] for k in ["quantize_state", "quant_block_size", "quant_nbits"]} for g in self.param_groups
-        ]
         super().load_state_dict(state_dict)
-        for group, overrides in zip(self.param_groups, current_overrides):
+        for group, overrides in zip(
+            self.param_groups,
+            [{k: g[k] for k in ["quantize_state", "quant_block_size", "quant_nbits"]} for g in self.param_groups],
+        ):
             group.update(overrides)
 
     def _get_options(self, param_shape):
