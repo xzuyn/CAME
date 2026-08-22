@@ -240,9 +240,6 @@ class CAME(torch.optim.Optimizer):
                 10: ( 3, torch.int32, 10,  0x3FF, 20),  #  3 x 10-bit per int32 (30/32) [ 93.75%]
                 11: ( 5, torch.int64, 11,  0x7FF, 44),  #  5 x 11-bit per int64 (55/64) [ 85.94%]
                 12: ( 5, torch.int64, 12,  0xFFF, 48),  #  5 x 12-bit per int64 (60/64) [ 93.75%]
-                13: ( 1, torch.int16, 13, 0x1FFF,  0),  #  1 x 13-bit per int16 (13/16) [ 81.25%]
-                14: ( 1, torch.int16, 14, 0x3FFF,  0),  #  1 x 14-bit per int16 (14/16) [ 87.50%]
-                15: ( 1, torch.int16, 15, 0x7FFF,  0),  #  1 x 15-bit per int16 (15/16) [ 93.75%]
             }
             chunk_size, dtype, step, mask, start_shift = pack_cfg[nbits]
             unpacked = torch.empty(
